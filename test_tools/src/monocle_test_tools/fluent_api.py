@@ -1,6 +1,8 @@
 from functools import wraps
 import inspect
+import json
 import os
+from pathlib import Path
 from typing import Optional, Union
 from monocle_apptrace.instrumentation.common.method_wrappers import monocle_trace_method
 from monocle_apptrace.instrumentation.common.utils import get_workflow_name
@@ -106,6 +108,28 @@ class TraceAssertion():
         self._filtered_spans = None
         TraceAssertion._assertion_errors = []
 
+    @staticmethod
+    def _validate_count_params(count: Optional[int], min_count: Optional[int], max_count: Optional[int]) -> None:
+        """Validate that count parameters are not conflicting."""
+        if count is not None and (min_count is not None or max_count is not None):
+            raise ValueError("Cannot specify both 'count' and 'min_count'/'max_count'")
+
+    def _check_aggregate_count(self, spans: list[Span], entity_type: str, count: Optional[int],
+                                min_count: Optional[int], max_count: Optional[int], message: Optional[str]) -> None:
+        """Helper to check count constraints for aggregate methods."""
+        actual_count = len(spans)
+        
+        if count is not None or min_count is not None or max_count is not None:
+            if count is not None and actual_count != count:
+                raise AssertionError(message or f"Found {actual_count} total {entity_type} invocations, expected exactly {count}")
+            if min_count is not None and actual_count < min_count:
+                raise AssertionError(message or f"Found {actual_count} total {entity_type} invocations, expected at least {min_count}")
+            if max_count is not None and actual_count > max_count:
+                raise AssertionError(message or f"Found {actual_count} total {entity_type} invocations, expected at most {max_count}")
+        else:
+            if actual_count == 0:
+                raise AssertionError(message or f"No {entity_type} invocations found")
+
     def run_agent(self, agent, agent_type:str, *args, **kwargs) -> any:
         """Run the given agent with provided args and kwargs."""
         return self.validator.run_agent(agent, agent_type, *args, mock_tools=self.mock_tools, **kwargs)
@@ -192,13 +216,24 @@ class TraceAssertion():
         return self
 
     @collect_assertions
-    def called_tool(self, tool_name:str, agent_name:Optional[str] = None, message:Optional[str] = None) -> 'TraceAssertion':
-        """Assert that the given tool was called, optionally by a specific agent."""
+    def called_tool(self, tool_name:str, agent_name:Optional[str] = None, count:Optional[int] = None,
+                    min_count:Optional[int] = None, max_count:Optional[int] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert tool invocation with optional agent filter and count constraints (count, min_count, max_count)."""
+        TraceAssertion._validate_count_params(count, min_count, max_count)
         self._filtered_spans = self.validator._get_tool_invocation_spans(tool_name, agent_name, filtered_spans=self._filtered_spans)
-        if agent_name:
-            TraceAssertion._assert_on_spans(self._filtered_spans, f"Tool '{tool_name}' was not called by agent '{agent_name}'", custom_message=message)
+        actual_count = len(self._filtered_spans)
+        
+        if count is not None or min_count is not None or max_count is not None:
+            entity_prefix = f"Tool '{tool_name}' was called by agent '{agent_name}'" if agent_name else f"Tool '{tool_name}' was called"
+            if count is not None and actual_count != count:
+                raise AssertionError(message or f"{entity_prefix} {actual_count} times, expected exactly {count}")
+            if min_count is not None and actual_count < min_count:
+                raise AssertionError(message or f"{entity_prefix} {actual_count} times, expected at least {min_count}")
+            if max_count is not None and actual_count > max_count:
+                raise AssertionError(message or f"{entity_prefix} {actual_count} times, expected at most {max_count}")
         else:
-            TraceAssertion._assert_on_spans(self._filtered_spans, f"Tool '{tool_name}' was not called", custom_message=message)
+            not_called_msg = f"Tool '{tool_name}' was not called by agent '{agent_name}'" if agent_name else f"Tool '{tool_name}' was not called"
+            TraceAssertion._assert_on_spans(self._filtered_spans, not_called_msg, custom_message=message)
         return self
 
     @collect_assertions
@@ -212,10 +247,22 @@ class TraceAssertion():
         return self
 
     @collect_assertions
-    def called_agent(self, agent_name:str, message:Optional[str] = None) -> 'TraceAssertion':
-        """Assert that the given agent was called."""
+    def called_agent(self, agent_name:str, count:Optional[int] = None, min_count:Optional[int] = None, 
+                     max_count:Optional[int] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert agent invocation with optional count constraints (count, min_count, max_count)."""
+        TraceAssertion._validate_count_params(count, min_count, max_count)
         self._filtered_spans = self.validator._get_agent_invocation_spans(agent_name, filtered_spans=self._filtered_spans)
-        TraceAssertion._assert_on_spans(self._filtered_spans, f"Agent '{agent_name}' was not called", custom_message=message)
+        actual_count = len(self._filtered_spans)
+        
+        if count is not None or min_count is not None or max_count is not None:
+            if count is not None and actual_count != count:
+                raise AssertionError(message or f"Agent '{agent_name}' was called {actual_count} times, expected exactly {count}")
+            if min_count is not None and actual_count < min_count:
+                raise AssertionError(message or f"Agent '{agent_name}' was called {actual_count} times, expected at least {min_count}")
+            if max_count is not None and actual_count > max_count:
+                raise AssertionError(message or f"Agent '{agent_name}' was called {actual_count} times, expected at most {max_count}")
+        else:
+            TraceAssertion._assert_on_spans(self._filtered_spans, f"Agent '{agent_name}' was not called", custom_message=message)
         return self
 
     @collect_assertions
@@ -224,6 +271,70 @@ class TraceAssertion():
         _filtered_spans = self.validator._get_agent_invocation_spans(agent_name, filtered_spans=self._filtered_spans)
         TraceAssertion._assert_on_spans(_filtered_spans, f"Agent '{agent_name}' was called", positive_test=False, custom_message=message)
         return self
+
+    @collect_assertions
+    def called_agents(self, count:Optional[int] = None, min_count:Optional[int] = None,
+                      max_count:Optional[int] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert total agent invocations across all agents with count constraints (count, min_count, max_count)."""
+        TraceAssertion._validate_count_params(count, min_count, max_count)
+        agent_spans = self.validator._get_all_agent_invocation_spans(filtered_spans=self._filtered_spans)
+        self._check_aggregate_count(agent_spans, "agent", count, min_count, max_count, message)
+        return self
+
+    @collect_assertions
+    def called_tools(self, count:Optional[int] = None, min_count:Optional[int] = None,
+                     max_count:Optional[int] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert total tool invocations across all tools with count constraints (count, min_count, max_count)."""
+        TraceAssertion._validate_count_params(count, min_count, max_count)
+        tool_spans = self.validator._get_all_tool_invocation_spans(filtered_spans=self._filtered_spans)
+        self._check_aggregate_count(tool_spans, "tool", count, min_count, max_count, message)
+        return self
+
+    @collect_assertions
+    def has_attribute(self, key:str, value:Optional[any] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that a span carries the given attribute (optionally with a specific value).
+
+        Filters the current spans down to those matching, so subsequent chained
+        assertions operate on the matching subset. When ``value`` is None, only the
+        presence of the attribute is checked.
+        """
+        matching_spans = self._filter_spans_by_attribute(self._filtered_spans, key, value)
+        self._filtered_spans = matching_spans
+        if not matching_spans:
+            if message:
+                raise AssertionError(message)
+            if value is None:
+                raise AssertionError(f"No span found with attribute '{key}'")
+            raise AssertionError(f"No span found with attribute '{key}' == '{value}'")
+        return self
+
+    @collect_assertions
+    def does_not_have_attribute(self, key:str, value:Optional[any] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that no span carries the given attribute (optionally with a specific value)."""
+        matching_spans = self._filter_spans_by_attribute(self._filtered_spans, key, value)
+        if matching_spans:
+            if message:
+                raise AssertionError(message)
+            if value is None:
+                raise AssertionError(f"Span found with attribute '{key}', but was not expected")
+            raise AssertionError(f"Span found with attribute '{key}' == '{value}', but was not expected")
+        return self
+
+    def _filter_spans_by_attribute(self, spans:Optional[list[Span]], key:str, value:Optional[any]) -> list[Span]:
+        """Return spans whose attribute ``key`` is present (and equals ``value`` when given)."""
+        matching_spans = []
+        for span in spans or []:
+            actual_value = span.attributes.get(key)
+            if actual_value is None:
+                continue
+            if value is None:
+                matching_spans.append(span)
+            elif isinstance(value, str) and isinstance(actual_value, str):
+                if self._comparer.compare(value, actual_value):
+                    matching_spans.append(span)
+            elif actual_value == value:
+                matching_spans.append(span)
+        return matching_spans
 
     @collect_assertions
     def has_input(self, expected_input:str, message:Optional[str] = None) -> 'TraceAssertion':
@@ -356,28 +467,204 @@ class TraceAssertion():
         return self
 
     @collect_assertions
-    def check_eval(self, eval_name:str, expected:Optional[Union[str, list[str]]] = None, not_expected:Optional[Union[str, list[str]]] = None, fact_name:Optional[str] = "traces", message:Optional[str] = None) -> 'TraceAssertion':
-        """Validate evaluation results for the current filtered spans."""
-        #verify expected and not_expected aren't empty
+    def has_scope(self, scope_name:str, expected_value:Optional[str] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that at least one filtered span has the specified scope.
+
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id', 'subscriptionId')
+            expected_value: Expected value for the scope. If omitted, only the
+                presence of the scope is checked, regardless of its value.
+            message: Optional custom error message
+
+        Example:
+            asserter.has_scope("tenant_id", "customer-123")  # value check
+            asserter.has_scope("tenant_id")                   # existence check
+        """
+        expected_values = None if expected_value is None else [expected_value]
+        self._verify_scope(self._filtered_spans, scope_name, expected_values,
+                          comparer=self._comparer, positive_test=True, custom_message=message)
+        return self
+
+    @collect_assertions
+    def has_any_scope(self, scope_name:str, *expected_values:str, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that spans have the specified scope with any of the expected values.
+        
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            expected_values: One or more expected values for the scope
+            message: Optional custom error message
+            
+        Example:
+            asserter.has_any_scope("tenant_id", "customer-123", "customer-456")
+        """
+        if not expected_values:
+            raise ValueError("At least one expected_value is required")
+        self._verify_scope(self._filtered_spans, scope_name, list(expected_values),
+                          comparer=self._comparer, positive_test=True, custom_message=message)
+        return self
+
+    @collect_assertions
+    def does_not_have_scope(self, scope_name:str, unexpected_value:Optional[str] = None, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that no filtered span has the specified scope.
+
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            unexpected_value: Value that should not be present. If omitted, the
+                scope must be entirely absent, regardless of its value.
+            message: Optional custom error message
+
+        Example:
+            asserter.does_not_have_scope("tenant_id", "customer-999")  # value check
+            asserter.does_not_have_scope("tenant_id")                   # absence check
+        """
+        unexpected_values = None if unexpected_value is None else [unexpected_value]
+        self._verify_scope(self._filtered_spans, scope_name, unexpected_values,
+                          comparer=self._comparer, positive_test=False, custom_message=message)
+        return self
+
+    @collect_assertions
+    def does_not_have_any_scope(self, scope_name:str, *unexpected_values:str, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that spans do not have the specified scope with any of the given values.
+        
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            unexpected_values: Values that should not be present
+            message: Optional custom error message
+            
+        Example:
+            asserter.does_not_have_any_scope("tenant_id", "customer-999", "customer-000")
+        """
+        if not unexpected_values:
+            raise ValueError("At least one unexpected_value is required")
+        self._verify_scope(self._filtered_spans, scope_name, list(unexpected_values),
+                          comparer=self._comparer, positive_test=False, custom_message=message)
+        return self
+
+    @collect_assertions
+    def contains_scope(self, scope_name:str, expected_substring:str, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that the scope value contains the expected substring.
+        
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            expected_substring: Substring that should be present in the scope value
+            message: Optional custom error message
+            
+        Example:
+            asserter.contains_scope("tenant_id", "customer")
+        """
+        self._verify_scope(self._filtered_spans, scope_name, [expected_substring],
+                          comparer=TokenMatchComparer(), positive_test=True, custom_message=message)
+        return self
+
+    @collect_assertions
+    def contains_any_scope(self, scope_name:str, *expected_substrings:str, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that the scope value contains any of the expected substrings.
+        
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            expected_substrings: Substrings to search for
+            message: Optional custom error message
+            
+        Example:
+            asserter.contains_any_scope("tenant_id", "customer", "client")
+        """
+        if not expected_substrings:
+            raise ValueError("At least one expected_substring is required")
+        self._verify_scope(self._filtered_spans, scope_name, list(expected_substrings),
+                          comparer=TokenMatchComparer(), positive_test=True, custom_message=message)
+        return self
+
+    @collect_assertions
+    def does_not_contain_scope(self, scope_name:str, unexpected_substring:str, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that the scope value does not contain the given substring.
+        
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            unexpected_substring: Substring that should not be present
+            message: Optional custom error message
+            
+        Example:
+            asserter.does_not_contain_scope("tenant_id", "admin")
+        """
+        self._verify_scope(self._filtered_spans, scope_name, [unexpected_substring],
+                          comparer=TokenMatchComparer(), positive_test=False, custom_message=message)
+        return self
+
+    @collect_assertions
+    def does_not_contain_any_scope(self, scope_name:str, *unexpected_substrings:str, message:Optional[str] = None) -> 'TraceAssertion':
+        """Assert that the scope value does not contain any of the given substrings.
+        
+        Args:
+            scope_name: Name of the scope (e.g., 'tenant_id')
+            unexpected_substrings: Substrings that should not be present
+            message: Optional custom error message
+            
+        Example:
+            asserter.does_not_contain_any_scope("tenant_id", "admin", "root")
+        """
+        if not unexpected_substrings:
+            raise ValueError("At least one unexpected_substring is required")
+        self._verify_scope(self._filtered_spans, scope_name, list(unexpected_substrings),
+                          comparer=TokenMatchComparer(), positive_test=False, custom_message=message)
+        return self
+
+    @collect_assertions
+    def check_eval(self, eval_name:Optional[str] = None, expected:Optional[Union[str, list[str]]] = None, not_expected:Optional[Union[str, list[str]]] = None, fact_name:Optional[str] = "traces", message:Optional[str] = None, template_path:Optional[str] = None) -> 'TraceAssertion':
+        """Validate evaluation results for the current filtered spans.
+
+        Provide exactly one of:
+          - eval_name: name of a standard Okahu eval template (e.g. "hallucination")
+          - template_path: filesystem path to a custom-template JSON file. The file
+            is loaded and the parsed dict is sent to the eval service. Server-side
+            validation errors (HTTP 400) surface as AssertionError with the prefix
+            'Custom template validation failed: <reason>'.
+        """
+        if eval_name and template_path:
+            raise ValueError("Provide either 'eval_name' or 'template_path', not both.")
+        if not eval_name and not template_path:
+            raise ValueError("Provide either 'eval_name' (for Okahu templates) or 'template_path' (for custom templates).")
+
+        template = None
+        if template_path:
+            path_obj = Path(template_path)
+            if not path_obj.is_file():
+                raise AssertionError(f"Custom template file not found: {template_path}")
+            try:
+                loaded = json.loads(path_obj.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise AssertionError(
+                    f"Custom template file is not valid JSON: {template_path} — {exc}"
+                ) from exc
+            # Accept either the inner template ({"name": ..., "eval_prompt": ..., ...})
+            # or the API-request-body shape ({"template": {...inner...}}). Unwrap the
+            # outer "template" key when present so evaluate() gets the inner dict —
+            # evaluate() will re-wrap once for the HTTP payload.
+            if (
+                isinstance(loaded, dict)
+                and set(loaded.keys()) == {"template"}
+                and isinstance(loaded["template"], dict)
+            ):
+                template = loaded["template"]
+            else:
+                template = loaded
+            eval_name = template.get("name", "custom_eval")
+
         if expected is None and not_expected is None:
             raise ValueError("At least one of 'expected' or 'not_expected' must be provided")
-        # Convert strings to lists for uniform processing
         positive = [expected] if isinstance(expected, str) else expected if expected is not None else []
         negative = [not_expected] if isinstance(not_expected, str) else not_expected if not_expected is not None else []
-        
-        # Check for overlapping instances in expected and not_expected
+
         if negative:
             overlap = set(positive) & set(negative)
             if overlap:
                 raise ValueError(f"Overlapping evaluation results found in 'expected' and 'not_expected': {overlap}. Please ensure they are mutually exclusive.")
-        
+
         if self._eval is None:
             raise AssertionError(message if message else "No evaluator configured. Call with_evaluation before check_eval.")
         if not self._filtered_spans:
             raise AssertionError(message if message else "No spans available for evaluation. Chain a span selector before check_eval.")
-        eval_result, explanation = self._eval.evaluate(filtered_spans=self._filtered_spans, eval_name=eval_name, fact_name=fact_name)        
-        
-        # Check expectations
+        eval_result, explanation = self._eval.evaluate(filtered_spans=self._filtered_spans, eval_name=eval_name, fact_name=fact_name, template=template)
+
         if (positive and eval_result not in positive) or (negative and eval_result in negative):
             if message:
                 raise AssertionError(message)
@@ -385,7 +672,7 @@ class TraceAssertion():
                 raise AssertionError(f"Evaluation '{eval_name}' did not match expected result. Expected one of {positive}. Received '{eval_result}'. \n Explanation: {explanation}")
             else:
                 raise AssertionError(f"Evaluation '{eval_name}' matched an unexpected result. Should not be any of {negative}. Received '{eval_result}'. \n Explanation: {explanation}")
-        
+
         return self
 
     @collect_assertions
@@ -413,6 +700,26 @@ class TraceAssertion():
             self._filtered_spans = filtered_spans
 
         TraceAssertion._assert_on_spans(filtered_spans, "No matching operation found", positive_test, expected_inputs, expected_outputs, custom_message)
+
+    def _verify_scope(self, spans:list[Span], scope_name:str, expected_values:Optional[list[str]],
+                      comparer:BaseComparer, positive_test:Optional[bool]=True, custom_message:Optional[str]=None) -> None:
+        """Verify that spans have the specified scope with expected value(s)."""
+        filtered_spans: list[Span] = self.validator._check_scope(spans, scope_name, expected_values, comparer, positive_test)
+        
+        if positive_test == True:
+            self._filtered_spans = filtered_spans
+
+        if expected_values and len(expected_values) > 0:
+            scope_description = f"scope '{scope_name}' with value(s) {expected_values}"
+        else:
+            scope_description = f"scope '{scope_name}'"
+        
+        if positive_test:
+            assertion_message = f"No spans found with {scope_description}"
+        else:
+            assertion_message = f"Found spans with {scope_description}"
+        
+        TraceAssertion._assert_on_spans(filtered_spans, assertion_message, positive_test, custom_message=custom_message)
 
     @staticmethod
     def _assert_on_spans(spans:list[Span], assertion_message:str, positive_test:bool = True,

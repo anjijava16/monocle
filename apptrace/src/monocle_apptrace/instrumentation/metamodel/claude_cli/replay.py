@@ -46,7 +46,16 @@ from monocle_apptrace.instrumentation.metamodel.claude_cli._helper import (
     read_transcript_tokens,
     read_subagent_transcript,
 )
+from monocle_apptrace.instrumentation.metamodel.claude_cli import git_context
 from monocle_apptrace.instrumentation.common.constants import AGENT_SESSION, SPAN_START_TIME, SPAN_END_TIME
+
+
+def _event_cwd(event: dict) -> str:
+    for key in ("cwd", "working_directory", "workspace_root", "project_dir", "project_root"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 # ── State helpers ─────────────────────────────────────────────────────────────
@@ -310,6 +319,10 @@ def _process_turn(turn_events: list, session_id: str, model: str, handler: Repla
             inference_rounds=inference_rounds,
             model=model,
             tokens=parent_tokens,
+            git_scopes=git_context.compute_scopes(
+                session_id,
+                cwd=_event_cwd(prompt_event) or _event_cwd(stop_event) or None,
+            ),
             _turn_start=prompt_ts,
             _turn_end=stop_ts,
             **{
@@ -403,6 +416,7 @@ def cleanup_session(session_id: str) -> None:
 
     _session_log(session_id).unlink(missing_ok=True)
     _state_file(session_id).unlink(missing_ok=True)
+    git_context.cleanup(session_id)
     logger.debug(f"SessionEnd: cleaned up session files for {session_id}")
 
 
