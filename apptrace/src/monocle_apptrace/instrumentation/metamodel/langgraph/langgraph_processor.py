@@ -2,7 +2,7 @@ import logging
 from opentelemetry.context import set_value, attach, detach, get_value
 from monocle_apptrace.instrumentation.common.constants import (
     AGENT_PREFIX_KEY, SCOPE_NAME, AGENT_NAME_KEY, AGENT_INVOCATION_SPAN_NAME,
-    LAST_AGENT_INVOCATION_ID, LAST_AGENT_NAME, AGENT_SESSION
+    AGENT_REQUEST_SPAN_NAME, LAST_AGENT_INVOCATION_ID, LAST_AGENT_NAME, AGENT_SESSION
 )
 from monocle_apptrace.instrumentation.common.span_handler import SpanHandler
 from monocle_apptrace.instrumentation.metamodel.langgraph._helper import (
@@ -43,11 +43,22 @@ class ParentCommandFilterSpan:
             return self.original_record_exception(exception, attributes, timestamp, escaped)
 
 class LanggraphAgentHandler(SpanHandler):
+    def skip_span(self, to_wrap, wrapped, instance, args, kwargs):
+        """Skip span creation for internal stream/astream calls made by invoke/ainvoke"""
+        method = to_wrap.get("method")
+        if method in ["stream", "astream"]:
+            # Check if we're already in an agentic.invocation or agentic.turn scope
+            # This happens when invoke() internally calls stream()
+            if is_scope_set(AGENT_INVOCATION_SPAN_NAME) or is_scope_set(AGENT_REQUEST_SPAN_NAME):
+                logger.debug(f"Skipping internal {method}() call within invoke/ainvoke - preventing duplicate agentic.invocation span")
+                return True
+        return super().skip_span(to_wrap, wrapped, instance, args, kwargs)
+
     def pre_tracing(self, to_wrap, wrapped, instance, args, kwargs):
         context = set_value(AGENT_NAME_KEY, get_name(instance))
         context = set_value(AGENT_PREFIX_KEY, DELEGATION_NAME_PREFIX, context)
         scope_name = AGENT_REQUEST.get("type")
-        is_streaming_call = to_wrap.get("method") in ["astream"]
+        is_streaming_call = to_wrap.get("method") in ["astream", "stream"]
         if not is_scope_set(scope_name):
             agent_request_wrapper = to_wrap.copy()
             if is_single_agent_instance(instance):

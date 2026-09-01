@@ -14,3 +14,35 @@ class AgentRunner:
         """Check if the runner has remote traces. This can be overridden if the runner needs to fetch traces in a specific way."""
         return None
 
+    async def end_session(self, session_id: str = None) -> None:
+        """Release any resources held for a live multi-turn session.
+
+        Runners that keep per-session state alive across turns (for example the
+        ADK runner, which caches an in-memory session service so the agent's
+        memory persists) should override this to drop that state once the
+        multi-turn run finishes. Runners that delegate session continuity to
+        their own framework (LangGraph thread_id, Strands FileSessionManager,
+        LlamaIndex chat store, MS Agent thread) need no cleanup, so the default
+        is a no-op.
+        """
+        return None
+    def get_remote_spans(self) -> list:
+        """Spans the runner obtained out-of-band (e.g. piggybacked on an HTTP response).
+        Default: none."""
+        return []
+
+    def get_remote_trace_query(self) -> dict:
+        """Identify this run's spans in the remote trace source.
+
+        Returned mapping is passed as keyword arguments to
+        ``MonocleValidator.import_traces`` (``id``, ``fact_name``,
+        ``workflow_name``, ...). Runners whose remote spans share the test's
+        trace id need nothing here, so the default is empty and the validator
+        falls back to looking the trace id up from the local spans.
+
+        A runner whose spans are produced in another process — and therefore
+        under a different trace id and workflow — overrides this to name the
+        fact that does identify them (for example an agent session id).
+        """
+        return {}
+

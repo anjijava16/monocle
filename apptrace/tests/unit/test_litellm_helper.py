@@ -6,12 +6,17 @@ So Monocle must read kwargs["optional_params"]["response_format"], not the top-l
 """
 import json
 import unittest
+from types import SimpleNamespace
 
 from pydantic import BaseModel
 
 from monocle_apptrace.instrumentation.metamodel.litellm._helper import (
+    extract_finish_reason,
     extract_messages,
     extract_response_format,
+    extract_temperature,
+    extract_tool_name,
+    extract_tool_type,
 )
 from monocle_apptrace.instrumentation.metamodel.litellm.entities.inference import (
     INFERENCE,
@@ -43,6 +48,41 @@ def _run_data_input(arguments):
         if event["name"] == "data.input":
             for attr in event["attributes"]:
                 out[attr["attribute"]] = attr["accessor"](arguments)
+    return out
+
+
+def _run_tool_attrs(arguments):
+    """Run the tool.name/tool.type accessors from the live INFERENCE metamodel."""
+    out = {}
+    for group in INFERENCE["attributes"]:
+        for attr in group:
+            if attr.get("_comment", "").startswith("Tool"):
+                out[attr["attribute"]] = attr["accessor"](arguments)
+    return out
+
+
+def _make_react_response(content, finish_reason="stop"):
+    message = SimpleNamespace(content=content, tool_calls=None)
+    choice = SimpleNamespace(finish_reason=finish_reason, message=message)
+    return SimpleNamespace(choices=[choice])
+
+
+def _make_native_tool_call_response(tool_name):
+    tool_call = SimpleNamespace(function=SimpleNamespace(name=tool_name))
+    message = SimpleNamespace(content=None, tool_calls=[tool_call])
+    choice = SimpleNamespace(finish_reason="tool_calls", message=message)
+    return SimpleNamespace(choices=[choice])
+
+
+def _run_metadata(arguments):
+    """Run the named metadata accessors from the live INFERENCE metamodel."""
+    out = {}
+    for event in INFERENCE["events"]:
+        if event["name"] == "metadata":
+            for attr in event["attributes"]:
+                # The usage accessor has no "attribute" key; skip it here.
+                if "attribute" in attr:
+                    out[attr["attribute"]] = attr["accessor"](arguments)
     return out
 
 
@@ -168,6 +208,113 @@ class TestLiteLLMExtractMessages(unittest.TestCase):
     def test_extract_messages_empty_when_no_messages(self):
         self.assertEqual(extract_messages({"data": {}}), [])
         self.assertEqual(extract_messages({}), [])
+
+
+class TestLiteLLMExtractTemperature(unittest.TestCase):
+    """temperature is moved into optional_params by the time the backend is called."""
+
+    def test_temperature_from_optional_params(self):
+        kwargs = {"optional_params": {"temperature": 0.7, "extra_body": {}}}
+        self.assertEqual(extract_temperature(kwargs), 0.7)
+
+    def test_temperature_zero_is_captured(self):
+        # temperature=0 (deterministic judge) is falsy but must NOT be treated as absent.
+        kwargs = {"optional_params": {"temperature": 0}}
+        self.assertEqual(extract_temperature(kwargs), 0)
+
+    def test_temperature_from_azure_data_dict(self):
+        # Azure async passes an already-built request under data.
+        kwargs = {"data": {"temperature": 0.2}}
+        self.assertEqual(extract_temperature(kwargs), 0.2)
+
+    def test_optional_params_takes_precedence_over_data(self):
+        kwargs = {"optional_params": {"temperature": 0}, "data": {"temperature": 0.9}}
+        self.assertEqual(extract_temperature(kwargs), 0)
+
+    def test_top_level_kwarg_fallback(self):
+        self.assertEqual(extract_temperature({"temperature": 0.5}), 0.5)
+
+    def test_absent_temperature_returns_none(self):
+        self.assertIsNone(extract_temperature({"optional_params": {"extra_body": {}}}))
+        self.assertIsNone(extract_temperature({}))
+
+    def test_none_optional_params_returns_none(self):
+        self.assertIsNone(extract_temperature({"optional_params": None}))
+
+
+class TestLiteLLMInferenceMetadata(unittest.TestCase):
+    """Coverage through the live INFERENCE metadata processor."""
+
+    def test_temperature_attribute_present(self):
+        arguments = {
+            "kwargs": {"optional_params": {"temperature": 0}},
+            "result": None,
+            "exception": None,
+        }
+        result = _run_metadata(arguments)
+        self.assertIn("temperature", result)
+        self.assertEqual(result["temperature"], 0)
+
+    def test_temperature_attribute_none_when_absent(self):
+        arguments = {
+            "kwargs": {"optional_params": {"extra_body": {}}},
+            "result": None,
+            "exception": None,
+        }
+        result = _run_metadata(arguments)
+        self.assertIn("temperature", result)
+        self.assertIsNone(result["temperature"])
+
+
+class TestLiteLLMReactStyleToolName(unittest.TestCase):
+    """CrewAI-style ReAct text tool calls ('Action: <tool>') carry no native
+    tool_calls entry. extract_finish_reason already reclassifies these as
+    finish_type=tool_call; extract_tool_name/extract_tool_type must agree on
+    the tool identity instead of reporting None for a span already typed as
+    a tool call.
+    """
+
+    def test_react_tool_call_populates_name_and_type(self):
+        response = _make_react_response(
+            "Thought: I should look this up\nAction: search_tool\nAction Input: {}"
+        )
+        arguments = {"result": response, "exception": None}
+        self.assertEqual(extract_finish_reason(arguments), "tool_calls")
+        self.assertEqual(extract_tool_name(arguments), "search_tool")
+        self.assertIsNotNone(extract_tool_type(arguments))
+
+    def test_react_tool_call_strips_surrounding_whitespace(self):
+        response = _make_react_response("Thought: ok\nAction:   spaced_tool  \n")
+        arguments = {"result": response, "exception": None}
+        self.assertEqual(extract_tool_name(arguments), "spaced_tool")
+
+    def test_react_final_answer_is_not_a_tool_call(self):
+        response = _make_react_response("Thought: done\nAction: Final Answer: 42")
+        arguments = {"result": response, "exception": None}
+        self.assertEqual(extract_finish_reason(arguments), "stop")
+        self.assertIsNone(extract_tool_name(arguments))
+        self.assertIsNone(extract_tool_type(arguments))
+
+    def test_plain_stop_without_action_line_returns_none(self):
+        response = _make_react_response("just a normal reply")
+        arguments = {"result": response, "exception": None}
+        self.assertEqual(extract_finish_reason(arguments), "stop")
+        self.assertIsNone(extract_tool_name(arguments))
+
+    def test_native_tool_call_still_resolves(self):
+        # Regression guard: the ReAct fallback must not shadow the existing
+        # native tool_calls path (OpenAI/Bedrock/Azure function calling).
+        response = _make_native_tool_call_response("native_tool")
+        arguments = {"result": response, "exception": None}
+        self.assertEqual(extract_tool_name(arguments), "native_tool")
+        self.assertIsNotNone(extract_tool_type(arguments))
+
+    def test_react_tool_call_through_live_inference_metamodel(self):
+        response = _make_react_response("Thought: ok\nAction: weather_tool")
+        arguments = {"result": response, "exception": None}
+        result = _run_tool_attrs(arguments)
+        self.assertEqual(result["name"], "weather_tool")
+        self.assertIsNotNone(result["type"])
 
 
 if __name__ == "__main__":

@@ -1,9 +1,104 @@
 ## Unreleased
 
+- fix(exporters): span obfuscation no longer swallows the sentence punctuation after an unquoted credential value — `password=hunter2. Next sentence.` now redacts to `password=<REDACTED>. Next sentence.` instead of `password=<REDACTED> Next sentence.`. Dots inside the value are still treated as part of the secret
+- fix(instrumentation): `extract_tool_name`/`extract_tool_type` in the LiteLLM metamodel now recognize ReAct-style text tool calls ("Action: <tool>", used by CrewAI), matching `extract_finish_reason`'s existing handling of the same response shape. Previously the span was typed as a tool call but `tool.name`/`tool.type` stayed `None` ([#797](https://github.com/monocle2ai/monocle/issues/797))
+- feat(test_tools): `check_eval`'s `eval_name` accepts either a built-in eval template name or the path of a custom eval template JSON file (a `pathlib.Path` or a path-like string), instead of the caller having to switch to the `template_path` parameter for custom templates. Which kind it is is detected from the value, using the evaluator's existing built-in vs. custom rule (`BaseEval.classify_eval_input`)
+- feat(exporters)!: pluggable sensitive-data obfuscation for span exports, **on by default** — `data.input` / `data.output` payloads are scrubbed before a span reaches any exporter, so credentials never leave the process. Redacts API keys (OpenAI, Anthropic, AWS, Google, GitHub, Slack), bearer tokens, JWTs, PEM private keys and `api_key`/`password`/`client_secret`-style assignments, and deliberately leaves everything else alone. Disable with `MONOCLE_DISABLE_SPAN_OBFUSCATION=true`, `MONOCLE_SPAN_OBFUSCATORS=none`, or `setup_monocle_telemetry(span_obfuscators=[])`. Add PII detection with `MONOCLE_SPAN_OBFUSCATORS=credentials,presidio` (`pip install monocle_apptrace[obfuscation]`), or plug in your own `SpanObfuscator` by `module:ClassName` path; scope it with `MONOCLE_OBFUSCATE_SPAN_TYPES`. See [docs/monocle_span_obfuscation.md](docs/monocle_span_obfuscation.md)
+- feat(test_tools)!: the eval-result matrix row is now template-agnostic — `judge_output` carries the judge's structured output verbatim, and the `hallucination`-specific `claim_verdicts`, `hallucination_types` and `entity_match_check` columns are removed. Previously only those three fields were promoted, so every other template's `structure_output` (e.g. `addressed_aspects` / `missing_aspects` / `completeness_score` on `conversation_completeness`) was dropped and downstream analysis had only the free-text `explanation` to parse. **Migration:** read `row["judge_output"]["claim_verdicts"]` instead of `row["claim_verdicts"]`.
+- feat(exporters): add ClickHouse span exporter (`MONOCLE_EXPORTER=clickhouse`), configured via `MONOCLE_CLICKHOUSE_CONNECTION_URL`; install with the `clickhouse` extra
 - feat(exporters): configurable file-name prefix for file and Azure Blob exporters via `MONOCLE_FILE_PREFIX` and `MONOCLE_BLOB_FILE_PREFIX`; S3 `MONOCLE_S3_KEY_PREFIX` renamed to `MONOCLE_S3_FILE_PREFIX` (old name still works with deprecation warning) ([#149](https://github.com/monocle2ai/monocle/issues/149))
 - chore(deps): add `opentelemetry-exporter-otlp-proto-http` as a default dependency so the OTLP exporter works out of the box ([#570](https://github.com/monocle2ai/monocle/issues/570))
 - feat(exporters): add `MONOCLE_CONSOLE` env var to enable console output alongside any configured exporter ([#577](https://github.com/monocle2ai/monocle/pull/577))
 - fix(test_tools): lazy-load `SentenceTransformer` to prevent crash at pytest collection time in network-restricted environments ([#576](https://github.com/monocle2ai/monocle/pull/576))
+- feat(test_tools): add `agentcore` runner to invoke an agent deployed to AWS Bedrock AgentCore Runtime remotely via boto3 `invoke_agent_runtime`, with session-based retrieval of the deployed agent's spans from Okahu
+- feat(test_tools): runners can identify their remote spans by a fact other than the trace id via `AgentRunner.get_remote_trace_query()`; the `agentcore` runner uses it to correlate the deployed agent's spans by the AgentCore session, so existing assertions apply to them
+- feat: an agent deployed to AWS Bedrock AgentCore returns its spans in the invocation response when `MONOCLE_ENABLE_TRACE_RETURN` is set, and the `agentcore` runner strips them off before the caller sees the response — no trace backend needed. Falls back to session-based retrieval when the deployed agent does not return them
+- fix!: an agent deployed to AWS Bedrock AgentCore now authorizes each caller before returning its spans, the same gate every HTTP framework applies — the deployment declares a key in `MONOCLE_TRACE_RETRIEVAL_DEFAULT_KEY` (or a callback in `MONOCLE_TRACE_RETRIEVAL_CALLBACK`), and the `agentcore` runner presents `MONOCLE_TRACE_RETRIEVAL_KEY` on the invocation. Previously `MONOCLE_ENABLE_TRACE_RETURN` alone returned spans to every caller. **Migration:** deployments using trace return must set `MONOCLE_TRACE_RETRIEVAL_DEFAULT_KEY` and tests must set `MONOCLE_TRACE_RETRIEVAL_KEY` to match, or no spans come back
+
+## Version 0.8.14 (2026-08-27)
+
+- fix(exporters): span obfuscation no longer swallows the sentence punctuation after an unquoted credential value — `password=hunter2. Next sentence.` now redacts to `password=<REDACTED>. Next sentence.` instead of `password=<REDACTED> Next sentence.`. Dots inside the value are still treated as part of the secret
+- fix(instrumentation): `extract_tool_name`/`extract_tool_type` in the LiteLLM metamodel now recognize ReAct-style text tool calls ("Action: <tool>", used by CrewAI), matching `extract_finish_reason`'s existing handling of the same response shape. Previously the span was typed as a tool call but `tool.name`/`tool.type` stayed `None` ([#797](https://github.com/monocle2ai/monocle/issues/797))
+- feat(test_tools): `check_eval`'s `eval_name` accepts either a built-in eval template name or the path of a custom eval template JSON file (a `pathlib.Path` or a path-like string), instead of the caller having to switch to the `template_path` parameter for custom templates. Which kind it is is detected from the value, using the evaluator's existing built-in vs. custom rule (`BaseEval.classify_eval_input`)
+- feat(exporters)!: pluggable sensitive-data obfuscation for span exports, **on by default** — `data.input` / `data.output` payloads are scrubbed before a span reaches any exporter, so credentials never leave the process. Redacts API keys (OpenAI, Anthropic, AWS, Google, GitHub, Slack), bearer tokens, JWTs, PEM private keys and `api_key`/`password`/`client_secret`-style assignments, and deliberately leaves everything else alone. Disable with `MONOCLE_DISABLE_SPAN_OBFUSCATION=true`, `MONOCLE_SPAN_OBFUSCATORS=none`, or `setup_monocle_telemetry(span_obfuscators=[])`. Add PII detection with `MONOCLE_SPAN_OBFUSCATORS=credentials,presidio` (`pip install monocle_apptrace[obfuscation]`), or plug in your own `SpanObfuscator` by `module:ClassName` path; scope it with `MONOCLE_OBFUSCATE_SPAN_TYPES`. See [docs/monocle_span_obfuscation.md](docs/monocle_span_obfuscation.md)
+
+## Version 0.8.13 (2026-08-20)
+
+- feat(test_tools): `check_eval`'s `eval_name` accepts either a built-in eval template name or the path of a custom eval template JSON file (a `pathlib.Path` or a path-like string), instead of the caller having to switch to the `template_path` parameter for custom templates. Which kind it is is detected from the value, using the evaluator's existing built-in vs. custom rule (`BaseEval.classify_eval_input`) ([#791](https://github.com/monocle2ai/monocle/pull/791))
+- fix!: an agent deployed to AWS Bedrock AgentCore now authorizes each caller before returning its spans, the same gate every HTTP framework applies — the deployment declares a key in `MONOCLE_TRACE_RETRIEVAL_DEFAULT_KEY` (or a callback in `MONOCLE_TRACE_RETRIEVAL_CALLBACK`), and the `agentcore` runner presents `MONOCLE_TRACE_RETRIEVAL_KEY` on the invocation. Previously `MONOCLE_ENABLE_TRACE_RETURN` alone returned spans to every caller. **Migration:** deployments using trace return must set `MONOCLE_TRACE_RETRIEVAL_DEFAULT_KEY` and tests must set `MONOCLE_TRACE_RETRIEVAL_KEY` to match, or no spans come back ([#793](https://github.com/monocle2ai/monocle/pull/793))
+- feat(test_tools): the test generator automatically discovers the evals already configured for an agent and adds matching `check_eval` assertions to the generated tests, resolving the evaluator through the eval registry (`BaseEval`) instead of importing Okahu directly; custom eval templates are supported and the eval trace search is no longer capped at 90 days ([#777](https://github.com/monocle2ai/monocle/pull/777))
+- fix(instrumentation): health check spans that answer with a response body (`{"status":"ok"}`, `OK`, ...) are recognized as health checks and sampled down to one span per reset counter, instead of being exported as real traffic. Recognition is by route (`/health`, `/healthz`, `/livez`, `/readyz`, `/ping` and friends, including any path ending in one of them such as `/actuator/health`), replaceable via `MONOCLE_HEALTH_CHECK_ROUTES`; request params or a request body still force an export. Failing health checks are also always exported now on `fastapi`, `flask`, `aiohttp` and `azfunc`, whose metamodels report `status_code` rather than the `error_code` the check previously read ([#792](https://github.com/monocle2ai/monocle/pull/792))
+
+## Version 0.8.12 (2026-08-17)
+
+- feat(exporters): add ClickHouse span exporter (`MONOCLE_EXPORTER=clickhouse`), configured via `MONOCLE_CLICKHOUSE_CONNECTION_URL`; install with the `clickhouse` extra
+- feat(exporters): configurable file-name prefix for file and Azure Blob exporters via `MONOCLE_FILE_PREFIX` and `MONOCLE_BLOB_FILE_PREFIX`; S3 `MONOCLE_S3_KEY_PREFIX` renamed to `MONOCLE_S3_FILE_PREFIX` (old name still works with deprecation warning) ([#149](https://github.com/monocle2ai/monocle/issues/149))
+- chore(deps): add `opentelemetry-exporter-otlp-proto-http` as a default dependency so the OTLP exporter works out of the box ([#570](https://github.com/monocle2ai/monocle/issues/570))
+- feat(exporters): add `MONOCLE_CONSOLE` env var to enable console output alongside any configured exporter ([#577](https://github.com/monocle2ai/monocle/pull/577))
+- fix(test_tools): lazy-load `SentenceTransformer` to prevent crash at pytest collection time in network-restricted environments ([#576](https://github.com/monocle2ai/monocle/pull/576))
+- feat(test_tools): add `agentcore` runner to invoke an agent deployed to AWS Bedrock AgentCore Runtime remotely via boto3 `invoke_agent_runtime`, with session-based retrieval of the deployed agent's spans from Okahu
+- feat(test_tools): runners can identify their remote spans by a fact other than the trace id via `AgentRunner.get_remote_trace_query()`; the `agentcore` runner uses it to correlate the deployed agent's spans by the AgentCore session, so existing assertions apply to them
+- feat: an agent deployed to AWS Bedrock AgentCore returns its spans in the invocation response when `MONOCLE_ENABLE_TRACE_RETURN` is set, and the `agentcore` runner strips them off before the caller sees the response — no trace backend needed. Falls back to session-based retrieval when the deployed agent does not return them
+- feat(instrumentation): custom spans can omit the traced method's inputs and/or outputs via `@monocle_trace_method(exclude="inputs")` or an `exclude: [inputs, outputs]` key in an `instrument` config entry, so methods handling credentials, PII or payment details can be traced without capturing that data — excluded accessors are left out of the processor, so the values are never serialized. An excluded-output span still records `error_code`, and an unrecognized exclusion name warns instead of raising ([#784](https://github.com/monocle2ai/monocle/pull/784))
+- feat(test_tools): assertions can be scoped to a single turn of a multi-turn run, and `check_eval` now reports every failing fact with a per-fact breakdown instead of raising on the first one ([#775](https://github.com/monocle2ai/monocle/pull/775))
+- fix(test_tools): `run_agent_async` auto-numbers turns per session ("1", "2", ...) when `turn_id` is unset, matching the documented default that previously applied only to the multi-turn runner; the resolved turn id is also persisted back onto the turn ([#780](https://github.com/monocle2ai/monocle/pull/780))
+- chore(deps): bump `GitPython` to 3.1.58 in `monocle_test_tools` ([#776](https://github.com/monocle2ai/monocle/pull/776))
+- feat(test_tools): the eval-result matrix row is now template-agnostic — `judge_output` carries the judge's structured output verbatim, and the `hallucination`-specific `claim_verdicts`, `hallucination_types` and `entity_match_check` columns are removed. Previously only those three fields were promoted, so every other template's `structure_output` (e.g. `addressed_aspects` / `missing_aspects` / `completeness_score` on `conversation_completeness`) was dropped and downstream analysis had only the free-text `explanation` to parse. **Migration:** read `row["judge_output"]["claim_verdicts"]` instead of `row["claim_verdicts"]`.
+
+## Version 0.8.11 (2026-08-03)
+- fix: Disable the second API call that stored evaluation results when `shadow_eval = True`, fixing duplicate eval result storage ([#771](https://github.com/monocle2ai/monocle/pull/771))
+- feat: Capture Anthropic cache token counts ([#768](https://github.com/monocle2ai/monocle/pull/768))
+- fix: Fix Haystack sentence transformer import and library version ([#767](https://github.com/monocle2ai/monocle/pull/767))
+- feat: Add support for Haystack 3.x.x and update integration tests ([#765](https://github.com/monocle2ai/monocle/pull/765))
+- feat: Capture cache token counts for Azure AI traces ([#766](https://github.com/monocle2ai/monocle/pull/766))
+- feat: Capture cached token counts for OpenAI ([#762](https://github.com/monocle2ai/monocle/pull/762))
+- feat: Test generator - live Okahu eval assertions and eval-source support ([#750](https://github.com/monocle2ai/monocle/pull/750))
+- feat(test-tools): Record test outcome as an Okahu label on cleanup ([#760](https://github.com/monocle2ai/monocle/pull/760))
+- feat: Support retrieving traces from the agentic app for remote testing ([#753](https://github.com/monocle2ai/monocle/pull/753))
+- feat: Pull spans for a fact other than trace for the test generator ([#761](https://github.com/monocle2ai/monocle/pull/761))
+- feat: Add multi-turn test runner with live session persistence ([#754](https://github.com/monocle2ai/monocle/pull/754))
+- fix(exporters): Require explicit bucket/container name in cloud exporters ([#759](https://github.com/monocle2ai/monocle/pull/759))
+- chore: Move `post_process_span_internal` to a common method ([#737](https://github.com/monocle2ai/monocle/pull/737))
+- docs: Copy changelog updates from v0.8.10 ([#758](https://github.com/monocle2ai/monocle/pull/758))
+
+## Version 0.8.10 (2026-07-25)
+- fix: Anthropic stream fix and OpenAI test fix ([#755](https://github.com/monocle2ai/monocle/pull/755))
+- docs: Document eval-matrix, CSV cases, and filtered/inline-template evals ([#751](https://github.com/monocle2ai/monocle/pull/751))
+- feat: ADK - bind turn scope to native invocation_id ([#733](https://github.com/monocle2ai/monocle/pull/733))
+- feat: Add CSV → fluent test-case adapter to monocle_test_tools ([#730](https://github.com/monocle2ai/monocle/pull/730))
+- feat: Filtered eval flow (check_eval_filtered) for built-in + custom templates ([#731](https://github.com/monocle2ai/monocle/pull/731))
+- fix: Changed scope_name from agent.invocation to agentic.invocation for invoke/ainvoke/stream/astream paths ([#736](https://github.com/monocle2ai/monocle/pull/736))
+- feat: Add subcommand dispatch to monocle_test_tools CLI ([#734](https://github.com/monocle2ai/monocle/pull/734))
+- test: Add streaming scenario tests for existing framework instrumentation ([#732](https://github.com/monocle2ai/monocle/pull/732))
+- feat: OpenAI streaming changes ([#735](https://github.com/monocle2ai/monocle/pull/735))
+- feat: Added time filter to Okahu evals for improved performance ([#728](https://github.com/monocle2ai/monocle/pull/728))
+- feat: Mistral streaming implementation with tests ([#729](https://github.com/monocle2ai/monocle/pull/729))
+- feat: LiteLLM - Responses API coverage + non-streaming tool-call output ([#726](https://github.com/monocle2ai/monocle/pull/726))
+- feat: Surface eval total_tokens + opt-in eval-matrix recorder plugin ([#722](https://github.com/monocle2ai/monocle/pull/722))
+- feat: CrewAI streaming ([#648](https://github.com/monocle2ai/monocle/pull/648))
+- feat: LiteLLM streaming implementation ([#641](https://github.com/monocle2ai/monocle/pull/641))
+- feat: Anthropic agents streaming ([#620](https://github.com/monocle2ai/monocle/pull/620))
+- feat: Strands streaming ([#516](https://github.com/monocle2ai/monocle/pull/516))
+- feat: Implemented generic API that verifies any attribute/entity of span ([#721](https://github.com/monocle2ai/monocle/pull/721))
+- fix: Ensures file encoding is utf-8, adds Windows support ([#725](https://github.com/monocle2ai/monocle/pull/725))
+- test: Add optional dependency guards and install extras in CI ([#727](https://github.com/monocle2ai/monocle/pull/727))
+- fix: Fix HTTP span truncation in FastAPI and Flask instrumentation ([#514](https://github.com/monocle2ai/monocle/pull/514))
+- test: Unit test for postgres fix ([#723](https://github.com/monocle2ai/monocle/pull/723))
+- feat: Allow multiple runs of a test (pytest-repeat) ([#386](https://github.com/monocle2ai/monocle/pull/386))
+- feat: Improve OTLP interoperability for GenAI traces ([#712](https://github.com/monocle2ai/monocle/pull/712))
+- chore: Updated bedrock version ([#720](https://github.com/monocle2ai/monocle/pull/720))
+- docs: Add documentation for custom instrumentation configured in external files ([#718](https://github.com/monocle2ai/monocle/pull/718))
+- chore: Update git and pytest versions to address vulnerabilities ([#717](https://github.com/monocle2ai/monocle/pull/717))
+- test: Update unit test yaml to install postgres package ([#715](https://github.com/monocle2ai/monocle/pull/715))
+- docs: Update TSC chair details ([#713](https://github.com/monocle2ai/monocle/pull/713))
+- docs: Moved guides to docs folder and updated readme ([#711](https://github.com/monocle2ai/monocle/pull/711))
+- feat: Assert arbitrary span events ([#709](https://github.com/monocle2ai/monocle/pull/709))
+- feat: Postgres exporter ([#682](https://github.com/monocle2ai/monocle/pull/682))
+- chore: Update project security disclosure per the OpenSSF best practices ([#707](https://github.com/monocle2ai/monocle/pull/707))
+- docs: Updated test tool documentation ([#705](https://github.com/monocle2ai/monocle/pull/705))
+- feat: Capture request temperature on inference span metadata ([#703](https://github.com/monocle2ai/monocle/pull/703))
+- feat: Improve test generator to add additional types of assertions ([#704](https://github.com/monocle2ai/monocle/pull/704))
+- fix: Fixed Release and Discussion Creation Errors ([#702](https://github.com/monocle2ai/monocle/pull/702))
 
 ## Version 0.8.7 (2026-07-02)
 - fix: Add direct file read for span loader ([676](https://github.com/monocle2ai/monocle/pull/676))

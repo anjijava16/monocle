@@ -99,8 +99,13 @@ Supported exporters:
 - `memory` - Store traces in memory (useful for testing)
 - `s3` - Upload traces to AWS S3 bucket
 - `blob` - Upload traces to Azure Blob Storage
+- `gcs` - Upload traces to Google Cloud Storage
 - `okahu` - Send traces to Okahu observability platform
 - `otlp` - Send traces to any OTLP-compatible backend (e.g., Jaeger, Zipkin, Grafana Tempo, OpenTelemetry Collector)
+- `otlp-genai-semconv` - Send traces over OTLP and add OpenTelemetry `gen_ai.*` semantic attributes
+- `postgres` - Write traces to a PostgreSQL `traces` table (set `MONOCLE_POSTGRES_CONNECTION_URL`; install the `postgres` extra)
+- `clickhouse` - Write traces to a ClickHouse `traces` table (set `MONOCLE_CLICKHOUSE_CONNECTION_URL`; install the `clickhouse` extra)
+- `paygentic` - Send traces to Paygentic
 
 Examples:
 ```bash
@@ -113,12 +118,31 @@ export MONOCLE_EXPORTER=console
 # Use OTLP exporter
 export MONOCLE_EXPORTER=otlp
 
+# Use OTLP exporter with GenAI semantic attributes
+export MONOCLE_EXPORTER=otlp-genai-semconv
+
 # Use multiple exporters (file and console)
 export MONOCLE_EXPORTER=file,console
 
 # Use OTLP and file exporters
 export MONOCLE_EXPORTER=otlp,file
 ```
+
+### Using the ClickHouse Exporter
+The `clickhouse` exporter writes each span to a `traces` table (created on first use). Install the extra and point it at a ClickHouse server:
+
+```bash
+pip install "monocle-apptrace[clickhouse]"
+export MONOCLE_EXPORTER=clickhouse
+
+# Self-hosted (native or HTTP interface)
+export MONOCLE_CLICKHOUSE_CONNECTION_URL="clickhouse://user:pass@host:8123/db"
+
+# ClickHouse Cloud — use the secure endpoint (TLS is required)
+export MONOCLE_CLICKHOUSE_CONNECTION_URL="https://user:pass@your-service.clickhouse.cloud:8443/db"
+```
+
+`attributes` and `metadata` are stored as `JSON`, `events` as `Array(JSON)`, and status as `status_code` / `status_message` columns, so span sub-fields are queryable directly (for example `attributes.\`span.type\``). This requires a ClickHouse version that supports the `JSON` type — a recent self-hosted build, or any current ClickHouse Cloud service. The database user needs `CREATE TABLE` on the first run, or you can pre-create the `traces` table and grant the user insert access.
 
 ### Using OTLP Exporter for OpenTelemetry-Compatible Backends
 The OTLP (OpenTelemetry Protocol) exporter allows you to send traces to any OTLP-compatible collectors.
@@ -141,6 +165,103 @@ export OTEL_EXPORTER_OTLP_HEADERS="api-key=your-api-key"
 
 # Optional: Configure timeout (in milliseconds, default: 10000)
 export OTEL_EXPORTER_OTLP_TIMEOUT=15000
+```
+
+Header names and values use the standard OTLP environment-variable format. Percent-encode spaces and other reserved
+characters in header values. For example, an authenticated backend with a tenant header can be configured as:
+
+```bash
+export MONOCLE_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://observability.example.com/v1/traces
+export OTEL_EXPORTER_OTLP_TRACES_HEADERS="Authorization=Bearer%20your-token,X-Tenant-ID=your-tenant"
+```
+
+Monocle can export to Okahu and an OTLP backend simultaneously:
+
+```bash
+export MONOCLE_EXPORTER=okahu,otlp
+```
+
+#### OpenTelemetry GenAI semantic conventions
+
+The existing `otlp` exporter preserves Monocle's original span attributes. To add OpenTelemetry `gen_ai.*`
+attributes alongside the existing Monocle metamodel attributes, select the `otlp-genai-semconv` exporter:
+
+```bash
+export MONOCLE_EXPORTER=otlp-genai-semconv
+```
+
+Both exporter names use the same OTLP endpoint, headers, and timeout configuration. Control semantic-convention
+enrichment explicitly with:
+
+```bash
+# Default: enable only when otlp-genai-semconv is configured
+export MONOCLE_OTEL_GENAI_SEMCONV=auto
+
+# Explicit overrides, including custom SpanProcessor configurations
+export MONOCLE_OTEL_GENAI_SEMCONV=true
+export MONOCLE_OTEL_GENAI_SEMCONV=false
+```
+
+The same override is available programmatically:
+
+```python
+setup_monocle_telemetry(
+    workflow_name="my_app",
+    otel_genai_semconv=True,
+)
+```
+
+Monocle isolates automatically instrumented spans from non-Monocle OpenTelemetry spans by default. To include both in one parent/child trace hierarchy, set this before importing Monocle:
+
+```bash
+export MONOCLE_ISOLATE_SPANS=false
+```
+
+#### Obfuscating sensitive data before export
+
+Span `data.input` / `data.output` payloads can contain API keys, passwords, PCI or PII data. Monocle
+scrubs them before a span reaches any exporter. **This is on by default**: with no configuration,
+credentials — API keys, passwords, tokens and private keys — are redacted, and nothing else is
+touched.
+
+```bash
+# turn it off
+export MONOCLE_DISABLE_SPAN_OBFUSCATION=true
+
+# add PII detection via Presidio (pip install monocle_apptrace[obfuscation]),
+# scoped to the span types that carry model traffic
+export MONOCLE_SPAN_OBFUSCATORS=credentials,presidio
+export MONOCLE_OBFUSCATE_SPAN_TYPES=inference,inference.*
+```
+
+```python
+# an explicit list overrides the environment; [] disables obfuscation
+setup_monocle_telemetry(
+    workflow_name="my_app",
+    span_obfuscators=[RegexSpanObfuscator(span_types=["inference", "inference.*"])],
+)
+```
+
+See [obfuscating sensitive data](monocle_span_obfuscation.md) for the pattern groups, the built-in
+obfuscators, and how to write your own.
+
+#### Health check sampling
+
+Health checks run every few seconds and would otherwise fill the trace with HTTP spans, so Monocle
+exports only one in every 100 of them. A span is treated as a health check when it is a `GET`/`HEAD`
+request that carries no request params or body, returns a success status, and either has an empty
+response or targets a well known health check route (`/health`, `/healthz`, `/healthcheck`,
+`/health-check`, `/livez`, `/liveness`, `/readyz`, `/readiness`, `/ping`, `/_health`, and any path
+ending in one of those, eg `/actuator/health`). Health checks that **fail** are always exported, so
+a failure is never sampled away.
+
+```bash
+# export every health check span
+export MONOCLE_SAMPLE_HEALTH_CHECKS=false
+
+# replace the health check routes above with your own comma separated list
+export MONOCLE_HEALTH_CHECK_ROUTES=/health,/status-check
 ```
 
 #### Example with OpenTelemetry Collector
@@ -252,6 +373,46 @@ setup_monocle_telemetry(
         ])
 
 ```
+
+#### Custom instrumentation without code (YAML)
+
+Instead of passing `wrapper_methods=[...]` in code, you can declare the same methods in a YAML file that Monocle reads automatically at `setup_monocle_telemetry()` time. This lets you instrument methods in your own code or in third-party libraries without any Python changes.
+
+By default Monocle looks for the file at `<cwd>/.monocle/custom_instrumentation.yaml`. To use a different directory, set the `MONOCLE_CUSTOM_INSTRUMENTATION_FILE_PATH` environment variable (the file name `custom_instrumentation.yaml` is fixed; the env var overrides only the directory, resolved relative to the current working directory):
+
+```bash
+export MONOCLE_CUSTOM_INSTRUMENTATION_FILE_PATH=config/monocle
+# → config/monocle/custom_instrumentation.yaml
+```
+
+The file is optional — if it is missing, custom instrumentation is silently skipped.
+
+```yaml
+instrument:
+  - package: myapp.services       # importable module path (required)
+    class: PaymentService         # class holding the method (required)
+    method: charge                # method to wrap (required)
+    span_name: payment.charge     # optional span name (defaults to Monocle's convention)
+    sync: true                    # optional; false for async methods (default: true)
+
+  - package: myapp.agents
+    class: ResearchAgent
+    method: run_async
+    span_name: agent.research
+    sync: false                   # wrapped with the async task wrapper
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `package` | Yes | Importable module path where the class lives |
+| `class` | Yes | Class name whose method will be instrumented |
+| `method` | Yes | Method name to wrap |
+| `span_name` | No | Custom span name; falls back to the default naming if omitted |
+| `sync` | No | `true` (default) wraps a synchronous method; `false` wraps an `async` method |
+
+Each valid entry is wrapped with Monocle's generic span processor, so spans carry the standard captured attributes (`instance`, `args`, `kwargs`, `output`). Entries missing any of `package`, `class`, or `method` are skipped with a warning. These wrappers are merged with the built-in framework methods and any `wrapper_methods=[...]` you pass programmatically.
+
+> **Note:** Loading requires `pyyaml`. It is imported lazily and only needed when the config file is actually present.
 
 ### Going beyond supported genAI components
 - If you are using an application framework, model hosting service/infra etc. that's not currently supported by Monocle, please submit a github issue to add that support. 

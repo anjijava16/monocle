@@ -18,8 +18,8 @@ This document provides a comprehensive reference for all assertions supported by
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `under_token_limit()` | `token_limit` | **Asserts:** The total token count across all spans is below the specified limit. Fails if limit is exceeded. |
-| `under_duration()` | `duration_limit` | **Asserts:** The workflow execution time is under the specified limit (in seconds). Fails if duration exceeds limit. |
-| `check_eval()` | `eval_name`, `expected_eval`, `fact_name="traces"` | **Asserts:** The evaluation result matches the expected value. Fails if evaluation result differs from expected. |
+| `under_duration()` | `duration_limit`, `units="seconds"`, `span_type="workflow"` | **Asserts:** Span durations are under the specified limit. `units`: `seconds` (default), `ms`, `minutes`. Fails if duration exceeds limit. |
+| `check_eval()` | `eval_name=None`, `expected=None`, `not_expected=None`, `fact_name="traces"`, `template_path=None`, `template=None`, `min_facts=1`, `fail_threshold=0`, `max_facts=None` | **Asserts:** The evaluation result matches (`expected`) / avoids (`not_expected`) the given label(s). Provide **exactly one** of `eval_name` (Okahu template), `template_path` (custom-template JSON file), or `template` (inline dict). `min_facts`/`fail_threshold`/`max_facts` apply only in time-window (filtered) mode. See the [evaluation API guide](monocle_evaluation_api.md) for filtered evaluation and result-report accessors. |
 
 ## Configuration Methods
 
@@ -28,12 +28,28 @@ This document provides a comprehensive reference for all assertions supported by
 | `with_evaluation()` | `eval`, `eval_options=None` | Configures the evaluation method for input/output comparisons (e.g., LLM-based) |
 | `with_comparer()` | `comparer` | Sets the comparison strategy for input/output matching (e.g., exact, token-based) |
 
-## Attribute Assertions
+## Attribute, Event, and Generic Assertions
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `has_attribute()` | `key`, `value=None` | **Asserts:** A span carries the given attribute (and, when `value` is provided, that it equals `value`). Narrows the filtered spans to the matches for further chaining. Fails if no span has the attribute/value. |
-| `does_not_have_attribute()` | `key`, `value=None` | **Asserts:** No span carries the given attribute (or the given attribute/value pair when `value` is provided). Fails if a matching span is found. |
+| `has_attribute()` | `attribute_name`, `expected=None` | **Asserts:** A span carries the given attribute (and, when `expected` is provided, that it equals `expected`). Narrows the filtered spans to the matches for further chaining. Fails if no span has the attribute/value. |
+| `does_not_have_attribute()` | `attribute_name`, `expected=None` | **Asserts:** No span carries the given attribute (or the given attribute/value pair when `expected` is provided). Fails if a matching span is found. |
+| `has_event()` | `event_name`, `attribute_name=None`, `expected=None` | **Asserts:** A span has an event named `event_name` (and, when `attribute_name`/`expected` are provided, that the event carries a matching attribute). Narrows the filtered spans to the matches for further chaining. Fails if no span has the event/attribute. |
+| `where()` | `attribute=None`, `event=None`, `predicate=None` | **Generic selector.** Narrows the filtered spans to those matching **all** given criteria (AND-ed): `attribute` is a `{name: expected}` mapping (`expected=None` checks presence), `event` is `{"name": <event_name>, "attributes": {<attr>: <expected>}}` (the `"attributes"` key is optional), and `predicate` is a `Callable[[Span], bool]`. Fails if no span matches. `has_attribute`/`has_event` are thin wrappers over this. |
+| `does_not_match()` | `attribute=None`, `event=None`, `predicate=None` | **Asserts:** No span matches all the given criteria (same arguments as `where`). Fails if a matching span is found. |
+
+### Generic `where()` example
+
+```python
+# Assert some span is an agentic turn that also emitted 1000 total tokens
+monocle_trace_asserter.where(
+    attribute={"span.type": "agentic.turn"},
+    event={"name": "metadata", "attributes": {"total_tokens": 1000}},
+)
+
+# Arbitrary matching with a predicate
+monocle_trace_asserter.where(predicate=lambda span: span.attributes.get("entity.count", 0) >= 2)
+```
 
 ## Input Assertions
 

@@ -253,11 +253,11 @@ This flexibility is especially useful when platform teams want to inject tracing
 | **MCP / A2A** | 🟢 FastMCP · 🟢 MCP client · 🟢 A2A client |
 | **Web / App** | 🟢 Flask · 🟢 AIO Http · 🟢 FastAPI · 🟢 Azure Function · 🟢 AWS Lambda · 🟢 Vercel (TS) · 🟢 Microsoft Teams AI SDK · 🟢 Web/REST client · 🔜 Google Function |
 | **LLM frameworks** | 🟢 Langchain · 🟢 Llamaindex · 🟢 Haystack |
-| **Agent Runtime** | 🟢 AWS Bedrock Agentcore |
-| **LLM inference** | 🟢 OpenAI · 🟢 Azure OpenAI · 🟢 Azure AI · 🟢 Nvidia Triton · 🟢 AWS Bedrock · 🟢 AWS Sagemaker · 🟢 Google Vertex · 🟢 Google Gemini · 🟢 Hugging Face · 🟢 Deepseek · 🟢 Anthropic · 🟢 Mistral · 🟢 LiteLLM · 🔜 Azure ML |
+| **Agent Runtime** | 🟢 AWS Bedrock Agentcore · 🟢 Azure AI Foundry |
+| **LLM inference** | 🟢 OpenAI · 🟢 Azure OpenAI · 🟢 Azure AI · 🟢 Azure AI Foundry · 🟢 Nvidia Triton · 🟢 AWS Bedrock · 🟢 AWS Sagemaker · 🟢 Google Vertex · 🟢 Google Gemini · 🟢 Hugging Face · 🟢 Deepseek · 🟢 Anthropic · 🟢 Mistral · 🟢 LiteLLM · 🔜 Azure ML |
 | **AI coding assistants** | 🟢 Claude CLI · 🟢 OpenAI Codex CLI · 🟢 GitHub Copilot (CLI + VS Code Chat) |
 | **Vector stores** | 🟢 FAISS · 🔜 OpenSearch · 🔜 Milvus |
-| **Exporters** | 🟢 stdout · 🟢 file · 🟢 Memory · 🟢 Azure Blob Storage · 🟢 AWS S3 · 🟢 Okahu cloud · 🟢 OTEL collectors · 🟢 Google Cloud Storage  · 🟢 [Paygentic](https://docs.paygentic.io/integrations/monocle) |
+| **Exporters** | 🟢 stdout · 🟢 file · 🟢 Memory · 🟢 Azure Blob Storage · 🟢 AWS S3 · 🟢 Okahu cloud · 🟢 OTEL collectors · 🟢 Google Cloud Storage · 🟢 PostgreSQL · 🟢 ClickHouse · 🟢 [Paygentic](https://docs.paygentic.io/integrations/monocle) |
 
 ## IDEs, ADK, and ecosystem integrations
 
@@ -289,7 +289,7 @@ These integrations make it easy to go from **local debug** → **CI/CD testing**
 
 | Resource | Description |
 | --- | --- |
-| **[User Guide](Monocle_User_Guide.md)** | Installation, configuration, and how traces are structured |
+| **[User Guide](docs/Monocle_User_Guide.md)** | Installation, configuration, and how traces are structured |
 | **[Trace API](docs/monocle_trace_api.md)** | `monocle_trace` / `amonocle_trace` and low-level `start_trace` / `stop_trace` |
 | **[Scope API](docs/monocle_scope_api.md)** | `monocle_trace_scope` helpers to attach scopes across spans |
 | **[Test Assertions](docs/monocle_test_assertions.md)** | Complete reference for all fluent API assertions in `monocle-test-tools` |

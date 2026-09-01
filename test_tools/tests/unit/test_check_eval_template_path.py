@@ -24,6 +24,29 @@ def _make_asserter(eval_result=("a", "ok")):
     return TraceAssertion(filtered_spans=[span], _eval=eval_mock)
 
 
+@pytest.fixture(autouse=True)
+def _reset_trace_assertion_class_state():
+    """Reset shared class-level TraceAssertion state before AND after each test.
+
+    Several tests here build a `TraceAssertion()` directly (bypassing the
+    `monocle_trace_asserter` fixture, whose teardown calls `cleanup()`) and
+    intentionally leave a recorded assertion behind. A manual reset as the LAST
+    statement of a test body is fragile: if an earlier assertion in that same
+    test body fails, the reset is skipped and the dirty class-level
+    `_assertion_errors` bleeds into whichever test runs next --
+    pytest_plugin.py's `pytest_runtest_makereport` flips any passing test to
+    failed when `TraceAssertion().has_assertions()` is true. An autouse fixture
+    with both a setup and a teardown reset closes that gap.
+    """
+    TraceAssertion._assertion_errors = []
+    TraceAssertion._eval_report = None
+    TraceAssertion._okahu_filter = None
+    yield
+    TraceAssertion._assertion_errors = []
+    TraceAssertion._eval_report = None
+    TraceAssertion._okahu_filter = None
+
+
 class TestCheckEvalTemplatePath:
 
     def test_wrapped_template_file_is_unwrapped_before_evaluate(self, tmp_path):
@@ -58,35 +81,47 @@ class TestCheckEvalTemplatePath:
         missing = tmp_path / "does_not_exist.json"
         asserter = _make_asserter()
 
-        result = asserter.check_eval(template_path=str(missing), expected="a")
+        # This test intentionally leaves a recorded assertion behind to inspect
+        # it below. pytest_plugin.py's pytest_runtest_makereport hook checks
+        # `TraceAssertion().has_assertions()` right after the test *call* phase
+        # finishes -- i.e. before the autouse fixture's teardown-side reset (that
+        # only runs in the later teardown phase) has a chance to run -- so the
+        # cleanup must happen inside the test body itself. The try/finally (rather
+        # than a bare last-statement reset) guarantees it runs even if an
+        # assertion above it fails, so a real regression here can't also
+        # contaminate whichever test runs next.
+        try:
+            result = asserter.check_eval(template_path=str(missing), expected="a")
 
-        assert result.has_assertions()
-        msg = result.get_assertion_messages()
-        assert "Custom template file not found" in msg
-        assert str(missing) in msg
-        # Clear assertions so pytest hook doesn't fail the test
-        TraceAssertion._assertion_errors = []
+            assert result.has_assertions()
+            msg = result.get_assertion_messages()
+            assert "Custom template file not found" in msg
+            assert str(missing) in msg
+        finally:
+            TraceAssertion._assertion_errors = []
 
     def test_invalid_json_raises_clean_assertion(self, tmp_path):
         path = tmp_path / "bad.json"
         path.write_text("{not valid json", encoding="utf-8")
         asserter = _make_asserter()
 
-        result = asserter.check_eval(template_path=str(path), expected="a")
+        # See the try/finally comment in test_missing_file_raises_clean_assertion.
+        try:
+            result = asserter.check_eval(template_path=str(path), expected="a")
 
-        assert result.has_assertions()
-        msg = result.get_assertion_messages()
-        assert "Custom template file is not valid JSON" in msg
-        assert str(path) in msg
-        # Clear assertions so pytest hook doesn't fail the test
-        TraceAssertion._assertion_errors = []
+            assert result.has_assertions()
+            msg = result.get_assertion_messages()
+            assert "Custom template file is not valid JSON" in msg
+            assert str(path) in msg
+        finally:
+            TraceAssertion._assertion_errors = []
 
     def test_both_eval_name_and_template_path_raises_value_error(self, tmp_path):
         path = tmp_path / "tpl.json"
         path.write_text(json.dumps(WRAPPED_TEMPLATE), encoding="utf-8")
         asserter = _make_asserter()
 
-        with pytest.raises(ValueError, match="not both"):
+        with pytest.raises(ValueError, match="exactly one"):
             asserter.check_eval(
                 eval_name="hallucination",
                 template_path=str(path),
@@ -96,5 +131,105 @@ class TestCheckEvalTemplatePath:
     def test_neither_eval_name_nor_template_path_raises_value_error(self):
         asserter = _make_asserter()
 
-        with pytest.raises(ValueError, match="Provide either"):
+        with pytest.raises(ValueError, match="exactly one"):
             asserter.check_eval(expected="a")
+
+    def test_eval_name_and_template_dict_both_raises_value_error(self):
+        """Passing both eval_name and template (dict) selectors is rejected,
+        matching the eval_name/template_path exactly-one behavior."""
+        asserter = _make_asserter()
+
+        with pytest.raises(ValueError, match="exactly one"):
+            asserter.check_eval(
+                eval_name="hallucination",
+                template=dict(INNER_TEMPLATE),
+                expected="a",
+            )
+
+    def test_path_like_string_eval_name_loads_custom_template(self, tmp_path):
+        """A path-like string in eval_name is detected as a custom template, so the
+        file is loaded and sent to evaluate() exactly as template_path would."""
+        path = tmp_path / "tpl.json"
+        path.write_text(json.dumps(WRAPPED_TEMPLATE), encoding="utf-8")
+        asserter = _make_asserter(eval_result=("a", "ok"))
+
+        result = asserter.check_eval(str(path), expected="a")
+
+        assert not result.has_assertions(), result.get_assertion_messages()
+        _, kwargs = asserter._eval.evaluate.call_args
+        assert kwargs["template"] == INNER_TEMPLATE      # unwrapped
+        # The eval name falls back to the template's own "name" field.
+        assert kwargs["eval_name"] == "test_template"
+
+    def test_path_object_eval_name_loads_custom_template(self, tmp_path):
+        """A Path (not just a path-like str) in eval_name is a custom template too."""
+        path = tmp_path / "tpl.json"
+        path.write_text(json.dumps(INNER_TEMPLATE), encoding="utf-8")
+        asserter = _make_asserter(eval_result=("a", "ok"))
+
+        result = asserter.check_eval(path, expected="a")
+
+        assert not result.has_assertions(), result.get_assertion_messages()
+        _, kwargs = asserter._eval.evaluate.call_args
+        assert kwargs["template"] == INNER_TEMPLATE
+        assert kwargs["eval_name"] == "test_template"
+
+    def test_bare_name_eval_name_stays_builtin(self):
+        """A bare name is a built-in template: it reaches evaluate() as eval_name,
+        with no template attached."""
+        asserter = _make_asserter(eval_result=("a", "ok"))
+
+        result = asserter.check_eval("hallucination", expected="a")
+
+        assert not result.has_assertions(), result.get_assertion_messages()
+        _, kwargs = asserter._eval.evaluate.call_args
+        assert kwargs["eval_name"] == "hallucination"
+        assert kwargs["template"] is None
+
+    def test_custom_eval_name_missing_file_raises_clean_assertion(self, tmp_path):
+        """A detected-custom eval_name reports a missing file the same way
+        template_path does."""
+        missing = tmp_path / "does_not_exist.json"
+        asserter = _make_asserter()
+
+        # See the try/finally comment in test_missing_file_raises_clean_assertion.
+        try:
+            result = asserter.check_eval(str(missing), expected="a")
+
+            assert result.has_assertions()
+            assert "Custom template file not found" in result.get_assertion_messages()
+        finally:
+            TraceAssertion._assertion_errors = []
+
+    def test_custom_eval_name_with_template_path_raises_value_error(self, tmp_path):
+        """eval_name resolved to a custom template, so a second custom selector conflicts."""
+        path = tmp_path / "tpl.json"
+        path.write_text(json.dumps(INNER_TEMPLATE), encoding="utf-8")
+        asserter = _make_asserter()
+
+        with pytest.raises(ValueError, match="do not also pass"):
+            asserter.check_eval(path, expected="a", template_path=str(path))
+
+    def test_custom_eval_name_with_inline_template_raises_value_error(self, tmp_path):
+        path = tmp_path / "tpl.json"
+        path.write_text(json.dumps(INNER_TEMPLATE), encoding="utf-8")
+        asserter = _make_asserter()
+
+        with pytest.raises(ValueError, match="do not also pass"):
+            asserter.check_eval(str(path), expected="a", template=dict(INNER_TEMPLATE))
+
+    def test_template_dict_selector_reaches_evaluate_unmodified(self):
+        """Regression test: an inline `template` dict passed to check_eval in
+        span mode must reach self._eval.evaluate(..., template=...) as-is,
+        not be clobbered by a stray `template = None` reset."""
+        asserter = _make_asserter(eval_result=("a", "ok"))
+        template_dict = dict(INNER_TEMPLATE)
+
+        result = asserter.check_eval(template=template_dict, expected="a")
+
+        assert not result.has_assertions(), result.get_assertion_messages()
+        _, kwargs = asserter._eval.evaluate.call_args
+        assert kwargs["template"] == template_dict
+        assert kwargs["template"] is not None
+        # eval_name should be derived from the template's "name" field.
+        assert kwargs["eval_name"] == "test_template"

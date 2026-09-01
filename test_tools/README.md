@@ -14,6 +14,8 @@ A comprehensive testing and validation framework for monocle AI agent tracing. T
 - **Fluent API**: Chain assertions using a readable, expressive builder pattern.
 - **Mock Tools**: Simulate tool behavior without invoking external dependencies.
 - **Offline Testing**: Assert against pre-recorded trace JSON files without running live agents.
+- **Test Cases as Data**: Describe a run once as a `FluentTestCase` and let `run_agent`, the span selectors, the input/output checks and `check_eval` all read it via `testcase=`.
+- **Generated Test Cases**: Turn what a workflow already recorded into a parametrizable suite with `setup_test_cases()`, from Okahu or a committed JSON file.
 
 ## How does it work
 
@@ -103,6 +105,102 @@ if __name__ == "__main__":
     pytest.main([__file__])
 ```
 
+### Multi-turn testing (`@monocle_multi_turn_testcase`)
+
+Single-turn tests run one input, collect one trace, and assert against it. Multi-turn testing runs an ordered list of turns against a single live agent session in one shot: the agent's own memory carries over between turns, spans from every turn are accumulated and grouped under one session id, and assertions can run per-turn or across the whole session.
+
+This is what enables testing an "incomplete input -> agent asks for a clarification -> follow-up input" flow, plus session-wide evals such as hallucination and user sentiment across the whole conversation rather than a single turn.
+
+Wrap the turns in a `MultiTurnTestCase`:
+
+```python
+import pytest
+from monocle_test_tools import MultiTurnTestCase, MonocleValidator
+from adk_travel_agent import root_agent
+
+multi_turn_cases: list[dict] = [
+    {
+        # A single session id groups every turn's spans (auto-generated if omitted).
+        "session_id": "booking_session_1",
+        "turns": [
+            # Turn 1: incomplete input, the agent should ask for the destination.
+            {
+                "test_input": ["Book me a flight for 26th Nov 2025."],
+                "test_spans": [
+                    {
+                        "span_type": "agentic.turn",
+                        "output": "Which city would you like to fly to?",
+                        "comparer": "similarity"
+                    }
+                ]
+            },
+            # Turn 2: the follow-up. The agent remembers the date from turn 1
+            # because both turns share one live session.
+            {
+                "test_input": ["Fly to Mumbai."],
+                "test_output": "A flight to Mumbai on November 26, 2025 has been booked.",
+                "comparer": "similarity"
+            }
+        ],
+        # Assertions across the accumulated spans of ALL turns.
+        "session_spans": [
+            {
+                "span_type": "agentic.tool.invocation",
+                "entities": [
+                    {"type": "tool", "name": "adk_book_flight"},
+                    {"type": "agent", "name": "adk_flight_booking_agent"}
+                ]
+            }
+        ]
+    }
+]
+
+@MonocleValidator().monocle_multi_turn_testcase(multi_turn_cases)
+async def test_multi_turn(multi_turn_case: MultiTurnTestCase):
+    await MonocleValidator().test_multi_turn_agent_async(root_agent, "google_adk", multi_turn_case)
+
+if __name__ == "__main__":
+    pytest.main([__file__])
+```
+
+Each turn is an ordinary `TestCase`, so per-turn `test_output`, `test_spans`, and evals work exactly as in single-turn tests, validated against that turn's spans. The `session_spans` block (and optional `session_output`) is validated against the spans accumulated across every turn.
+
+**Scoping an assertion to a specific turn.** Every turn runs inside its own turn scope, so each span it produces carries a `scope.turn_id` attribute (alongside the shared `scope.session_id`). The turn id is the turn's own `turn_id` when set, otherwise its 1-based index (`"1"`, `"2"`, ...). Use it in a `session_spans` assertion's `attributes` to require that a span happened in a particular turn:
+
+```python
+"turns": [
+    {"test_input": ["Book me a flight for 26th Nov 2025."], "turn_id": "collect_info"},
+    {"test_input": ["Fly to Mumbai."], "turn_id": "book"}
+],
+"session_spans": [
+    {
+        "span_type": "agentic.tool.invocation",
+        "entities": [{"type": "tool", "name": "adk_book_flight"}],
+        # the flight must have been booked in the "book" turn, not the first
+        "attributes": {"scope.turn_id": "book"}
+    }
+]
+```
+
+This works with the fluent API too. If you run each turn as a separate `run_agent_async` call with the same `session_id`, the turns are numbered (`"1"`, `"2"`, ...). Then check a turn with `has_scope`:
+
+```python
+await monocle_trace_asserter.run_agent_async(agent, "langgraph", "Book me a flight for 26th Nov 2025.", session_id="s")  # turn "1"
+await monocle_trace_asserter.run_agent_async(agent, "langgraph", "Fly to Mumbai.", session_id="s")                      # turn "2"
+
+monocle_trace_asserter.called_tool("adk_book_flight").has_scope("turn_id", "2")   # booked in turn 2
+```
+**Chaining turn output into the next input.** Use the `{previous_output}` placeholder in a later turn's `test_input` to feed the prior turn's result forward:
+
+```python
+"turns": [
+    {"test_input": ["Suggest a city to visit in November."]},
+    {"test_input": ["Book me a flight to {previous_output}."]}
+]
+```
+
+**Session persistence across runners.** The ADK runner keeps one in-memory session service alive for the whole multi-turn run, so agent memory persists between turns. Runners that delegate session continuity to their own framework keep memory across turns via the shared `session_id` too (LangGraph `thread_id`, Strands `FileSessionManager`, LlamaIndex chat store, MS Agent thread).
+
 ### Fluent API (`monocle_trace_asserter`)
 
 Use the `monocle_trace_asserter` pytest fixture to write expressive, chainable assertions. Each assertion method filters the span context for subsequent calls.
@@ -184,6 +282,26 @@ monocle_trace_asserter.called_agents(min_count=5, max_count=15)  # Between 5-15 
 
 # Total tool invocations across all tools
 monocle_trace_asserter.called_tools(max_count=20)  # At most 20 tool calls total
+```
+
+#### Scope, attribute, and event assertions
+
+Assert on monocle scopes, span attributes, and span events. `has_scope`, `has_attribute`, and `has_event` narrow the context to matching spans:
+
+```python
+# Scope carried by the trace (value check, existence check, and substring check)
+monocle_trace_asserter.has_scope("tenant_id", "customer-123")
+monocle_trace_asserter.has_scope("tenant_id")                  # presence only
+monocle_trace_asserter.contains_scope("tenant_id", "customer")
+
+# Any-of and negative scope assertions
+monocle_trace_asserter.has_any_scope("tenant_id", "customer-123", "customer-456")
+monocle_trace_asserter.does_not_have_scope("tenant_id", "customer-999")
+
+# Verify a span attribute on the matched tool invocation
+monocle_trace_asserter \
+    .called_tool("adk_book_flight") \
+    .has_attribute("entity.1.type", "tool.adk")
 ```
 
 ---
@@ -271,6 +389,47 @@ async def test_strands_agent(test_case: TestCase):
     )
 ```
 
+### AWS Bedrock AgentCore
+
+Unlike the other runners, `agentcore` is a *remote* runner: it invokes an agent already deployed to AWS Bedrock AgentCore Runtime via boto3, so no agent framework needs to be installed locally. The agent argument is the deployed agent's Runtime ARN (the endpoint-qualified form is accepted and split automatically):
+
+```python
+ARN = "arn:aws:bedrock-agentcore:us-east-1:<account>:runtime/<agent-id>"
+
+response = monocle_trace_asserter.run_agent(
+    ARN, "agentcore",
+    "Book a flight from San Jose to Seattle for 22 Nov 2026",
+    session_id=f"monocle_test_session_{uuid.uuid4().hex}",
+)
+```
+
+- **Region** is taken from the ARN, so the agent is reached in the region it was deployed to regardless of your local AWS default region.
+- **Payload** sent to the agent is `{"prompt": <message>}`, matching the `BedrockAgentCoreApp` entrypoint contract. Pass a dict to send a different shape verbatim.
+- **Response**: the runner reads the response stream and JSON-decodes it. An agent that returns text (the common case) yields a plain `str`; an agent returning a JSON object yields a `dict`.
+- **`session_id`** is sent as `runtimeSessionId` so the deployed agent keeps conversation context across turns. AWS requires at least 33 characters — Monocle's auto-generated session ids satisfy this, and shorter ids raise a `ValueError` rather than being silently rewritten. Omit it to let AgentCore generate one.
+- **Traces**: spans are produced *inside* the deployed agent and exported by its own Monocle instrumentation, so they are not in the test process. Retrieve them by session — the agent stamps the `runtimeSessionId` onto its spans as `scope.agentic.session`, which Okahu indexes as the `agent_sessions` fact:
+
+The runner retrieves them for you, so assertions apply to the remote spans directly:
+
+```python
+# AGENTCORE_TRACE_WORKFLOW=<workflow the deployed agent exports under>
+response = monocle_trace_asserter.run_agent(ARN, "agentcore", prompt, session_id=session_id)
+
+monocle_trace_asserter.called_tool("book_flight_tool")   # asserts on the remote spans
+```
+
+  This needs the workflow name the deployed agent reports under — its own, not the test's — via the `AGENTCORE_TRACE_WORKFLOW` environment variable or the runner's `trace_workflow_name` argument. Without it, retrieval is skipped and only the response is available to assert on. Allow a few seconds for the spans to reach Okahu after the call returns; the runner polls for up to `MONOCLE_REMOTE_TRACE_TIMEOUT` seconds (default 60).
+
+  To load a session explicitly instead — for example one from an earlier run, or when no workflow name is configured — use the trace source directly:
+
+```python
+monocle_trace_asserter.with_trace_source(
+    "okahu", id=session_id, fact_name="session", workflow_name="<agent's workflow name>",
+).called_tool("book_flight_tool")
+```
+
+Allow a few seconds for the spans to reach Okahu after the call returns.
+
 ---
 
 ## Offline Testing with Pre-Recorded Traces
@@ -341,78 +500,283 @@ def test_tool_span(validator):
 
 ---
 
+## Test Cases as Data (`FluentTestCase`)
+
+A `FluentTestCase` describes what a run should do — its input, the agents it invokes, the tools they call, the evals it should satisfy — as plain data. Pass it to the fluent API with `testcase=` and each method reads what it needs, instead of you unpacking the same dict by hand into a dozen calls.
+
+```python
+TESTCASE = {
+    "input": "Book a flight from SFO to Mumbai",
+    "expected": {
+        "agents": {
+            "supervisor":     {"output": "travel arrangements"},
+            "flight_agent":   {"output": "flight booked"},
+        },
+        "evals": {"hallucination": "no_hallucination"},
+    },
+}
+
+@pytest.mark.parametrize("testcase", [TESTCASE])
+@pytest.mark.asyncio
+async def test_booking(monocle_trace_asserter, testcase):
+    await monocle_trace_asserter.run_agent_async(root_agent, "google_adk", testcase=testcase)
+
+    monocle_trace_asserter.called_agent(testcase=testcase).contains_output(testcase=testcase)
+    monocle_trace_asserter.with_evaluation("okahu").check_eval(testcase=testcase)
+```
+
+The same dict drives the run, the agent assertions and the evals. Add an agent to the data and every one of those calls covers it.
+
+### Writing a test case
+
+A test case is a dict (or a `FluentTestCase`); both are accepted everywhere `testcase=` is.
+
+```python
+{
+  "name": "books a flight",              # optional; names the case in failures
+  "input": "Book a flight",              # a string, a tuple of args, or a FactID (below)
+  "expected": {                          # optional wrapper; these may also sit at the top level
+      "output": ["Booked flight", "Mumbai"],   # end-to-end check, no entity named
+      "agents": {"supervisor": {"input": "...", "output": "..."}},
+      "tools":  {"book_flight": {"output": "confirmed", "agent": {"flight_agent": {}}}},
+      "evals":  {"hallucination": "no_hallucination"},
+      "token_limit": 10000,
+  },
+}
+```
+
+- **A top-level `output`** is an end-to-end check that names no entity: a string, or a list where *every* entry must appear. The input/output checks fall back to it when no selector was chained, so `contains_output(testcase=tc)` on its own asserts against the whole trace. When a selector *did* run, the per-entity expectations are what count.
+- **`agents` / `tools` / `evals` accept a mapping** (`{name: body}`) or a list of single-key entries (`[{name: body}, ...]`). The mapping form reads better by hand; the list form allows the same name twice.
+- **An eval may name a category** in its key: `{"hallucination@llm": "minor_hallucination"}` is the `hallucination` eval in the `llm` category. Without `@`, no category.
+- **Unknown keys are rejected.** A typo like `"evels"` raises rather than silently asserting nothing.
+- **`input` may be a `FactID`** — `{"fact_id": "abc123", "fact_name": "traces", "source": "okahu"}` — pointing at a recorded fact instead of a literal prompt. `with_trace_source(testcase=...)` loads that fact's spans, and `run_agent(testcase=...)` fetches it purely to recover the prompt it was driven with and replays that against a live agent.
+
+### Where `testcase=` is accepted
+
+| Method | Reads | Behaviour |
+|---|---|---|
+| `run_agent` / `run_agent_async` | `input` | Runs with those args. A `FactID` input is resolved to the prompt it recorded and replayed |
+| `with_trace_source` | `input` (must be a `FactID`) | Loads that fact's spans. `source`/`workflow_name` stay explicit; `id`/`fact_name`/`scope_name` come from the FactID |
+| `called_agent` | `agents` | Asserts every named agent was invoked, and records each one's spans for the checks that follow |
+| `called_tool` | `tools` | Asserts every named tool was called, and records each one's spans |
+| `has_input` / `contains_input` / `does_not_have_input` / `does_not_contain_input` | `agents[].input` or `tools[].input` | Checks each entity's own expected input against that entity's spans |
+| `has_output` / `contains_output` / `does_not_have_output` / `does_not_contain_output` | `agents[].output` or `tools[].output` | Same, for outputs |
+| `check_eval` | `evals` | Runs each eval and compares against its recorded result |
+
+The input/output checks read `agents` or `tools` depending on which selector opened the chain.
+
+### How entities are matched
+
+`called_agent` and `called_tool` build a span list per entity, which the input/output checks then read.
+
+- **Agents key on the name.** Two entries naming the same agent share one span list, and each entry's own expectations are checked against it. That matters because `from_spans` records the same agent twice when it was invoked with different inputs.
+- **Tools key on the name *and* the calling agent.** `{"book_flight": {"agent": {"supervisor": {}}}}` matches only calls made by `supervisor`; an entry naming no agent matches any caller. Unlike agents, one tool called by two agents really is two different span sets.
+
+Every failure is collected and reported together: one missing agent out of four names all four in a single failure, rather than stopping at the first.
+
+### Rules
+
+- **A chain is all-testcase or none of it.** `called_agent(testcase=tc).contains_output("literal")` raises. Start a new chain to switch styles.
+- **One selector kind per chain.** `called_agent(testcase=tc).called_tool(testcase=tc)` raises — each selector builds its own entity map and combining them is ambiguous. Plain (non-testcase) chains are unaffected.
+- **Silence is not failure.** An entry that sets no `input`/`output` is skipped, and a check where nothing sets one passes quietly. A test case describes what it knows.
+- **Emptiness is failure.** `called_agent`/`called_tool`/`check_eval` raise when the test case names nothing for them to act on — a selector with nothing to select must not read as a pass.
+
+### Generating test cases from recorded runs
+
+`setup_test_cases()` turns what a workflow already recorded into a parametrizable list. Each returned case points at one fact and carries the agents it invoked, the tools they called, its token count, and optionally its eval results.
+
+```python
+from monocle_test_tools import setup_test_cases
+
+CASES = setup_test_cases(source="okahu", workflow_name="my_app",
+                         start_time="2026-05-01", end_time="2026-06-30",
+                         check_eval="hallucination")
+
+@pytest.mark.parametrize("testcase", CASES)
+def test_evals_still_reproduce(monocle_trace_asserter, testcase):
+    monocle_trace_asserter.with_trace_source(testcase=testcase, workflow_name="my_app")
+    monocle_trace_asserter.with_evaluation("okahu").check_eval(testcase=testcase)
+```
+
+Re-running the evals against their own recorded labels is a regression test: it catches an eval template change that would re-label previously graded facts.
+
+| Argument | Description |
+|---|---|
+| `source` | `"okahu"` (default) to discover from the eval store, or `"local"` to load a committed JSON file |
+| `workflow_name`, `start_time`, `end_time` | Required for Okahu. The window has no silent default |
+| `fact_name` | Fact level, default `"traces"`. Above trace level (`"agentic_turns"`, `"agentic_sessions"`, ...) each fact spans several traces and all their spans describe it |
+| `check_eval` | `True` for every eval recorded, a string for one, `False`/omitted for none. A fact with no labelled result is dropped |
+| `compare_eval` | Borrow the expected result from a *different* eval: the report is asked about this one, but each case still names `check_eval`. So the case reads "run `check_eval`, expect what `compare_eval` recorded" — the eval-tuning question of whether a new template reproduces a golden one's labels. Requires `check_eval` to be a name |
+| `eval_filter` | Narrows *which facts are considered*, as an `eval` query filter. Independent of `check_eval` |
+| `category` | Which eval runs count — `"llm"` (default), `"manual"`, `"test"`, or a list |
+| `path` | For `source="local"`: the JSON file to load |
+
+Because the model serializes into a shape it also accepts, a discovered set can be frozen and replayed with no network call:
+
+```python
+json.dump([c.model_dump() for c in CASES], open("cases.json", "w"))
+# later, offline:
+CASES = setup_test_cases(source="local", path="cases.json")
+```
+
+Since these cases carry agents and tools as well as evals, they feed the selectors too — `called_agent(testcase=tc).contains_output(testcase=tc)` asserts that a re-run still produces what the recording did.
+
+Each fact costs a request for its spans, plus one per fact above trace level to find its traces, plus one for the report. A wide window is a lot of calls — freeze the result to JSON if you will re-run it.
+
+### Three flows this enables
+
+**Eval regression** — do the recorded labels still reproduce? Cases carry each fact and the label it already has; re-running the eval must agree.
+
+```python
+CASES = setup_test_cases(source="okahu", workflow_name="my_app",
+                         start_time=ST, end_time=ET, check_eval="hallucination")
+
+@pytest.mark.parametrize("testcase", CASES)
+def test_regression(monocle_trace_asserter, testcase):
+    monocle_trace_asserter.with_trace_source(testcase=testcase, workflow_name="my_app")
+    monocle_trace_asserter.with_evaluation("okahu").check_eval(testcase=testcase)
+```
+
+**Eval tuning** — does a new template reproduce a golden one? `compare_eval` sources the expected label from the golden eval while the case still names the new one, so a failure means the two disagree.
+
+```python
+CASES = setup_test_cases(source="okahu", workflow_name="my_app",
+                         start_time=ST, end_time=ET,
+                         check_eval="hallucination_v2",       # what the test runs
+                         compare_eval="hallucination_v1")     # where "expected" comes from
+```
+
+**A/B replay** — does a *live* agent still behave like the recording? The `FactID` input is resolved to the prompt it was driven with and replayed against the running agent, then the fresh trace is asserted against what the recording did.
+
+```python
+@pytest.mark.parametrize("testcase", CASES)
+@pytest.mark.asyncio
+async def test_ab(monocle_trace_asserter, testcase):
+    await monocle_trace_asserter.run_agent_async(root_agent, "google_adk", testcase=testcase)
+
+    monocle_trace_asserter.called_agent(testcase=testcase).contains_output(testcase=testcase)
+    monocle_trace_asserter.called_tool(testcase=testcase)
+```
+
+---
+
 ## Test Generator
 
-Automatically generate test code by analyzing trace files. The generator scans spans and creates Python test assertions for agents, tools, and outputs.
+Automatically generate test code by analyzing trace files. The generator scans spans and creates Python test assertions for agents, tools, outputs, cost, and performance, plus evaluation assertions supplied as `--eval` parameters (built-in or custom, auto-detected).
 
 ### Quick Start
 
 ```bash
 # Generate test code from a trace file
-python -m monocle_test_tools.generate_test trace.json
+python -m monocle_test_tools generate_test --trace-file trace.json
 
 # With custom test name
-python -m monocle_test_tools.generate_test trace.json --test-name test_my_agent
+python -m monocle_test_tools generate_test --trace-file trace.json --test-name test_my_agent
+
+# Generate test code directly from an Okahu cloud trace
+python -m monocle_test_tools generate_test --trace-id <trace_id> --workflow-name <workflow_name>
+
+# Inject built-in eval assertions (--eval-source is required when using --eval)
+python -m monocle_test_tools generate_test --trace-id <trace_id> --workflow-name <workflow_name> \
+  --trace-source okahu --eval-source okahu \
+  --eval hallucination=no_hallucination \
+  --eval sentiment=positive
+
+# Inject a custom eval template assertion
+python -m monocle_test_tools generate_test --trace-id <trace_id> --workflow-name <workflow_name> \
+  --trace-source okahu --eval-source okahu \
+  --eval ./my_custom_eval.json=pass
+
+# Specify a different fact_name for all injected evals (default: traces)
+python -m monocle_test_tools generate_test --trace-id <trace_id> --workflow-name <workflow_name> \
+  --eval-source okahu --eval hallucination=no_hallucination --eval-fact agentic_turns
+
+# Only generate the loader for a specific trace source (file | okahu)
+python -m monocle_test_tools generate_test --trace-file trace.json --trace-source file
 
 # Save to file
-python -m monocle_test_tools.generate_test trace.json > test_generated.py
+python -m monocle_test_tools generate_test --trace-file trace.json > test_generated.py
+
+# The old module path still works
+python -m monocle_test_tools.generate_test trace.json
+```
+
+By default the generated test includes loader options for every supported trace
+source (file, Okahu, live agent run). Passing `--trace-source file` or
+`--trace-source okahu` emits only that loader (as active code).
+
+The `--eval` type is auto-detected from the value (or forced with a `builtin:` / `custom:` prefix):
+- **Built-in**: plain name (e.g. `hallucination`, `sentiment`) → `check_eval("hallucination", ...)`
+- **Custom**: value ends with `.json` or is a path → `check_eval(template_path="./my_eval.json", ...)`
+
+`--eval-source` is **required** when `--eval` is used. It sets the evaluator in the generated `with_evaluation(...)` call and drives how each `--eval` value is classified as built-in vs custom:
+
+```bash
+python -m monocle_test_tools generate_test --trace-file trace.json \
+  --eval-source okahu --eval hallucination=no_hallucination
+# ->  asserter.with_evaluation("okahu").check_eval("hallucination", expected="no_hallucination", ...)
 ```
 
 ### Example Output
 
+Generated tests load traces through the `with_trace_source` API and include
+cost (total tokens) and performance (turn duration) checks derived from the trace:
+
 ```python
 import pytest
 from monocle_test_tools import TraceAssertion
-from monocle_test_tools.span_loader import JSONSpanLoader
+
 
 def test_generated(monocle_trace_asserter: TraceAssertion):
     """Auto-generated test from trace analysis."""
-    
-    # Option 1: Load from JSON file
-    spans = JSONSpanLoader.from_json("path/to/trace.json")
-    # monocle_trace_asserter.validator.add_remote_spans(spans)
-    
+
+    # Option 1: Load from a local trace file
+    monocle_trace_asserter.with_trace_source("file", trace_path="path/to/trace.json")
+
     # Option 2: Load from Okahu
-    # from monocle_test_tools.span_loader import OkahuSpanLoader
-    # spans = OkahuSpanLoader.get_spans(workflow_name="your_workflow", trace_id="trace_id")
-    # monocle_trace_asserter.validator.add_remote_spans(spans)
-    
+    # monocle_trace_asserter.with_trace_source("okahu", id="TRACE_ID", workflow_name="WORKFLOW_NAME")
+
     # Option 3: Run agent directly
     # from your_module import your_agent
     # await monocle_trace_asserter.run_agent_async(your_agent, "framework_name", "user input")
-    
+
     asserter = monocle_trace_asserter
-    
+
     # Agent invocations with output checks
     asserter.called_agent("travel_agent").contains_output("Successfully booked")
     asserter.called_agent("hotel_agent").contains_output("Marriott reservation confirmed")
-    
+
     # Tool invocations
     asserter.called_tool("book_flight", "travel_agent")
     asserter.called_tool("book_hotel", "hotel_agent")
+
+    # Cost check: total tokens in the turn (derived from trace; adjust as needed)
+    asserter.under_token_limit(1204)
+
+    # Performance check: duration of the turn (derived from trace; adjust as needed)
+    asserter.under_duration(5.2, units="seconds", span_type="agent_turn")
+
+    # Eval assertions (from --eval parameters; require an eval service, e.g. Okahu)
+    asserter.with_evaluation("okahu").check_eval("hallucination", expected="pass")
 ```
 
-### Python API
+The Okahu cloud loader is **pre-populated** with the `id` (trace id) and
+`workflow_name` read from the trace itself, so it is ready to uncomment without
+editing placeholders.
+
+With `--trace-source file`, only the file loader line is emitted:
 
 ```python
-from monocle_test_tools.test_generator import TestGenerator
-
-# From local file
-generator = TestGenerator.from_json_file("trace.json")
-test_code = generator.generate_test_code(test_name="test_my_agent")
-print(test_code)
-
-# Write to file
-generator.write_to_file("test_my_agent.py")
-
-# From Okahu
-generator = TestGenerator.from_okahu(trace_id="abc123", workflow_name="my_app")
-print(generator.generate_test_code())
+    # Load traces from a local trace file
+    monocle_trace_asserter.with_trace_source("file", trace_path="path/to/trace.json")
 ```
 
 The generator extracts:
 - **Agent invocations** with output checks (first 80 chars as key phrase)
 - **Tool invocations** with parent agent references
+- **Total token usage** for the turn, emitted as an `under_token_limit()` check
+- **Turn duration**, emitted as an `under_duration(..., span_type="agent_turn")` check
+- **Trace id and workflow name**, used to pre-populate the Okahu cloud loader
 - **Sorted by invocation order** for readability
 
 ---
@@ -463,6 +827,26 @@ MockTool(
 
 Supported `ToolType` values: `tool.openai`, `tool.adk`, `tool.llama_index`, `tool.langgraph`, `tool.strands`.
 
+### Fluent API
+
+In the fluent API, register mock tools with `with_mock_tool()` before running the agent (call once per mock tool):
+
+```python
+@pytest.mark.asyncio
+async def test_with_mock_tool(monocle_trace_asserter):
+    monocle_trace_asserter.with_mock_tool(
+        MockTool(
+            name="adk_book_flight",
+            type=ToolType.ADK,
+            response={"status": "success", "message": "Flight booked from {{from_airport}} to {{to_airport}}."}
+        )
+    )
+    await monocle_trace_asserter.run_agent_async(root_agent, "google_adk",
+                        "Book a flight from San Francisco to Mumbai for 26th Nov 2025.")
+
+    monocle_trace_asserter.called_tool("adk_book_flight").contains_output("Flight booked")
+```
+
 ---
 
 ## Test Format Reference
@@ -496,6 +880,7 @@ Validation rules enforced by span type:
     "entities":         "List of entities involved. Each has 'type' (tool|agent|inference) and 'name'.",
     "input":            "Expected input for this interaction.",
     "output":           "Expected output from this interaction.",
+    "attributes":       "Expected span attributes (key/value pairs) to verify on the matched span.",
     "test_type":        "'positive' (default) or 'negative'. Negative tests assert the interaction does NOT occur.",
     "eval":             "Evaluation configuration. See Evaluation section.",
     "expect_errors":    "Whether errors are expected during this span.",
@@ -590,6 +975,8 @@ monocle_trace_asserter.with_evaluation("okahu") \
     .check_eval("conversation_completeness", expected="complete")
 ```
 
+> **When `fact_name` resolves to multiple facts** (e.g. `agentic_turns` across a multi-turn session), `check_eval` evaluates and asserts **every** fact — it fails if any single fact fails, and the error names each failing fact. To scope an eval to one turn instead, narrow the spans first (e.g. `.where(attribute={"scope.turn_id": "2"})`) so only that turn's fact is evaluated.
+
 #### Okahu `fact_name` values
 
 | `fact_name` | Description |
@@ -630,6 +1017,104 @@ The following eval template names have been validated against real traces in tes
 
 > Passing a template name or fact combination that does not exist in Okahu raises an `AssertionError` with the list of valid templates. Use `@pytest.mark.xfail` for tests that are expected to fail.
 
+### Custom Evaluation Templates
+
+Instead of a built-in `eval_name`, you can send your own template to the eval service. `check_eval` accepts **exactly one** of three mutually exclusive selectors: `eval_name` (a standard Okahu template), `template_path` (a path to a custom-template JSON file), or `template` (an inline custom-template dict).
+
+```python
+# From a file
+monocle_trace_asserter.called_agent("adk_flight_booking_agent")
+monocle_trace_asserter.with_evaluation("okahu") \
+    .check_eval(template_path="templates/my_custom_eval.json", expected="pass")
+
+# Custom template passed as eval_name instead — a path is recognised as a template file
+monocle_trace_asserter.with_evaluation("okahu") \
+    .check_eval("templates/my_custom_eval.json", expected="pass")
+
+# Inline dict (no file needed) — pass the template as a keyword-only argument
+monocle_trace_asserter.with_evaluation("okahu") \
+    .check_eval(template={"name": "my_eval", "eval_prompt": "...", "structure_output": {...}},
+                expected="pass")
+```
+
+So `eval_name` takes either kind of template and `check_eval` detects which: a `pathlib.Path`, or a string that ends in `.json` or contains a path separator, is a custom-template JSON file and is handled exactly as `template_path`; any other bare name is a built-in template. It is the same built-in vs. custom rule the test generator applies to its `--eval` values, and each evaluator owns it (`BaseEval.classify_eval_input`). Passing a custom-template path in `eval_name` *and* a `template_path`/`template` raises a `ValueError`.
+
+For `template_path`, the file may be either the inner template (`{"name": ..., "eval_prompt": ..., ...}`) or the full API request body (`{"template": {...}}`) — the outer `template` key is unwrapped automatically. When `eval_name` is omitted, the template's `name` field is used as the eval name (falling back to `"custom_eval"`). Server-side validation errors (HTTP 400) surface as an `AssertionError` prefixed with `Custom template validation failed:`.
+
+### Time-window (filtered) evaluation
+
+The examples above evaluate a **specific** trace/fact that you selected (by running an agent, or by `with_trace_source("okahu", id=...)`). You can instead evaluate **every fact discovered in a time window** for one or more workflows — without knowing the trace ids up front — by setting `start_time`/`end_time` on `with_trace_source("okahu", ...)`. This runs the evaluation as a single asynchronous Okahu job that discovers the matching facts server-side, applies one **blanket** `expected`/`not_expected` to each, and reports per fact.
+
+```python
+# Evaluate all traces for "my_app" in a time window against one blanket expectation
+monocle_trace_asserter \
+    .with_trace_source("okahu", workflow_name="my_app",
+                       start_time="2026-07-21T00:00:00Z", end_time="2026-07-22T00:00:00Z") \
+    .with_evaluation("okahu") \
+    .check_eval("hallucination", expected="no_hallucination", min_facts=5)
+```
+
+- **Mode is chosen by the source, not a separate method.** Supplying a time window (vs. an `id`) makes the *same* `check_eval` run the filtered flow. Providing both `id` and a time window raises; filter mode requires both `start_time` and `end_time` **and** a `workflow_name`.
+- `fact_name` (defaults to `traces`) selects the fact grain to discover.
+- **Filter-only `check_eval` parameters** (raise a `ValueError` if used without a time window):
+  - `min_facts` (default `1`) — fail the run if fewer than this many facts were discovered (guards against a vacuous pass on an empty window).
+  - `fail_threshold` (default `0`) — allow up to this many non-matching facts before the assertion fails.
+  - `max_facts` (default from `OKAHU_MAX_FACTS`, `1000`) — runaway guard; fail loudly if the window discovers more than this many facts.
+- **Results are uniform.** Both the filtered and the single-fact paths populate the same report, readable via the accessors below (filtered mode = N facts; single-fact mode = a 1-fact report), on pass **and** failure.
+
+| Method | Description |
+|---|---|
+| `get_eval_report()` | The eval report stashed by the last `check_eval` (dict with a `scenarios` list) |
+| `get_eval_failures()` | The subset of report scenarios whose `status` is not `pass` |
+| `write_eval_report(path)` | Write the report to a JSON file |
+
+### Eval result matrix
+
+An **opt-in** pytest recorder captures a per-test eval-result matrix (scenario, expected/actual label, judge output, token cost, pass/fail/error) across a whole run — useful for measuring eval stability and token cost without hand-rolling a `conftest.py` recorder. It is **off by default** and changes no behavior unless enabled.
+
+Enable it either way:
+
+```bash
+pytest --monocle-eval-matrix                       # writes test-eval-replay-matrix.json
+pytest --monocle-eval-matrix=path/to/matrix.json   # custom path
+MONOCLE_EVAL_MATRIX=1 pytest                        # via env var (default path)
+```
+
+A row is recorded for every test that calls `check_eval`. At session end the recorder writes `{"generated_at": <UTC ISO8601>, "records": [ ... ]}`, where each record has a fixed, template-agnostic schema: `run_id`, `scenario`, `trace_id`, `expected`, `actual`, `status` (`pass`/`fail`/`error`), `explanation`, `total_tokens`, (for the filtered flow) `fact_id`, `workflow`, `job_id`, and `judge_output` — the judge's structured output verbatim. No judge field is promoted to a top-level column, because every template defines its own `structure_output`: read `claim_verdicts` / `hallucination_types` / `entity_match_check` (hallucination), `addressed_aspects` / `missing_aspects` / `completeness_score` (conversation_completeness), `bias_types` (bias) and so on from `judge_output`. Path precedence: the `--monocle-eval-matrix` value, else `MONOCLE_EVAL_MATRIX`, else the default `test-eval-replay-matrix.json`.
+
+### CSV eval test cases
+
+For curating many eval cases as a flat spreadsheet, `monocle_test_tools` exports a CSV adapter — `load_cases_from_csv`, `CsvCase`, and the `@monocle_csv_cases` decorator — that parametrizes a one-line test stub over the rows and drives each through the fluent `check_eval` path. **Scope (v0): evaluation tests only** (fixed to the `okahu` trace source).
+
+**Config in code, data in CSV.** The test stub owns everything constant across the sheet (the evaluator, the eval template, the trace source); the CSV owns only what varies per row. One row = one test.
+
+```python
+import os
+from monocle_test_tools import monocle_csv_cases
+
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "hallucination_test.json")
+
+@monocle_csv_cases("cases.csv")
+def test_cases(monocle_trace_asserter, case):
+    case.run(monocle_trace_asserter.with_evaluation("okahu"), template_path=TEMPLATE_PATH)
+```
+
+Each row maps onto exactly three stable, eval-relevant fluent methods — `check_eval` (the label being tuned) plus two optional operational guard rails, `under_token_limit` and `under_duration`:
+
+| Column | Required | Maps to | Notes |
+|---|---|---|---|
+| `case_id` | ✅ | (test id) | Unique per row; duplicates are rejected at load time |
+| `fact_id` | ✅ | `with_trace_source(id=...)` | Identifier of the evaluated fact — equals the trace id when `fact_name=traces`, a finer-grained id otherwise |
+| `workflow_name` | ✅ | `with_trace_source(workflow_name=...)` | Okahu workflow name |
+| `fact_name` | | `check_eval(fact_name=...)` | Fact grain (defaults to `traces`) |
+| `expected` | one of these | `check_eval(expected=...)` | Multi-value: pipe-delimited (`a\|b`) or a JSON array |
+| `not_expected` | one of these | `check_eval(not_expected=...)` | Multi-value, same as `expected` |
+| `max_tokens` | | `under_token_limit(...)` | Token-budget guard rail |
+| `max_duration_ms` | | `under_duration(..., units="ms")` | Effort/latency guard rail |
+| `notes` | | (ignored) | Free-form documentation for curators |
+
+A row must declare an `expected` or `not_expected` label — a guard rail alone is not an eval test. `load_cases_from_csv(path)` can also be used standalone (returns a list of `CsvCase`) and reports load errors with the offending `line N`. A copy-ready example ships at [`examples/cases.example.csv`](examples/cases.example.csv) + [`examples/csv_cases_example.py`](examples/csv_cases_example.py).
+
 ---
 
 ## Supported Agent Frameworks (Runners)
@@ -643,6 +1128,7 @@ The following eval template names have been validated against real traces in tes
 | `llamaindex` | LlamaIndex |
 | `strands` | Strands Agents |
 | `msagent` | Microsoft Semantic Kernel / AutoGen |
+| `agentcore` | AWS Bedrock AgentCore Runtime 
 
 ---
 
@@ -650,21 +1136,32 @@ The following eval template names have been validated against real traces in tes
 
 The `monocle_trace_asserter` fixture provides a `TraceAssertion` instance. All assertion methods return `self` for chaining and accept an optional `message=` keyword argument for custom failure messages.
 
+### Configuration
+
+Configure the asserter before running assertions. These methods return `self` for chaining but do not themselves assert.
+
+| Method | Description |
+|---|---|
+| `with_trace_source(source="local", **kwargs)` | Choose where spans come from: `"local"` (in-memory, default), `"file"` (local `.monocle/*.json`), or `"okahu"` (cloud). File/Okahu kwargs: `id`, `trace_path` (file), `fact_name` (`trace`/`session`/`scope`), `scope_name`, `workflow_name` (required for Okahu). **Okahu time-window (filtered) mode:** pass `start_time` + `end_time` (both required) with `workflow_name` and no `id` to evaluate all discovered facts in a window (see [Time-window evaluation](#time-window-filtered-evaluation)) |
+| `with_comparer(comparer)` | Override the comparer for subsequent `has_*` assertions (see the Comparers table). Accepts a string key or `BaseComparer` instance |
+| `with_evaluation(eval, eval_options=None)` | Configure the evaluator (`"okahu"`, `"bert_score"`, or a `BaseEval` instance) before `check_eval` |
+| `with_mock_tool(mock_tool)` | Register a `MockTool` to simulate tool behavior during a subsequent `run_agent`/`run_agent_async` (fluent equivalent of `TestCase.mock_tools`). Call once per mock tool |
+
 ### Run agents
 
 | Method | Description |
 |---|---|
-| `run_agent(agent, agent_type, *args)` | Run a sync agent |
-| `await run_agent_async(agent, agent_type, *args, session_id=None)` | Run an async agent |
+| `run_agent(agent, agent_type, *args, testcase=None)` | Run a sync agent. `testcase=` takes the input from a [test case](#test-cases-as-data-fluenttestcase) instead of positional args |
+| `await run_agent_async(agent, agent_type, *args, session_id=None, testcase=None)` | Run an async agent, same `testcase=` support |
 | `load_spans(spans)` | Load pre-recorded `ReadableSpan` objects for offline assertions |
 
 ### Span selectors (narrow context for subsequent assertions)
 
 | Method | Description |
 |---|---|
-| `called_tool(tool_name, agent_name=None, count=None, min_count=None, max_count=None)` | Assert a tool was called; narrows context to those spans. Optional: `count` for exact count, `min_count`/`max_count` for range |
+| `called_tool(tool_name, agent_name=None, count=None, min_count=None, max_count=None, testcase=None)` | Assert a tool was called; narrows context to those spans. Optional: `count` for exact count, `min_count`/`max_count` for range. `testcase=` asserts every tool the [test case](#test-cases-as-data-fluenttestcase) names and records each one's spans |
 | `does_not_call_tool(tool_name, agent_name=None)` | Assert a tool was NOT called |
-| `called_agent(agent_name, count=None, min_count=None, max_count=None)` | Assert an agent was called; narrows context to those spans. Optional: `count` for exact count, `min_count`/`max_count` for range |
+| `called_agent(agent_name, count=None, min_count=None, max_count=None, testcase=None)` | Assert an agent was called; narrows context to those spans. Optional: `count` for exact count, `min_count`/`max_count` for range. `testcase=` asserts every agent the [test case](#test-cases-as-data-fluenttestcase) names and records each one's spans |
 | `does_not_call_agent(agent_name)` | Assert an agent was NOT called |
 | `called_agents(count=None, min_count=None, max_count=None)` | Assert total number of agent invocations across all agents. Optional: `count` for exact count, `min_count`/`max_count` for range |
 | `called_tools(count=None, min_count=None, max_count=None)` | Assert total number of tool invocations across all tools. Optional: `count` for exact count, `min_count`/`max_count` for range |
@@ -682,6 +1179,8 @@ The `monocle_trace_asserter` fixture provides a `TraceAssertion` instance. All a
 | `does_not_contain_input(substring)` | Input does not contain the substring |
 | `does_not_contain_any_input(*substrings)` | Input does not contain any of the substrings |
 
+Each of the four singular forms also accepts `testcase=`, checking each entity's own expected value from a [test case](#test-cases-as-data-fluenttestcase) against that entity's spans. The `_any_` variants do not: they take any-of values, and an entry records exactly one input and one output.
+
 ### Output assertions
 
 | Method | Description |
@@ -695,6 +1194,35 @@ The `monocle_trace_asserter` fixture provides a `TraceAssertion` instance. All a
 | `does_not_contain_output(substring)` | Output does not contain the substring |
 | `does_not_contain_any_output(*substrings)` | Output does not contain any of the substrings |
 
+Each of the four singular forms also accepts `testcase=`, checking each entity's own expected value from a [test case](#test-cases-as-data-fluenttestcase) against that entity's spans. The `_any_` variants do not: they take any-of values, and an entry records exactly one input and one output.
+
+### Attribute assertions
+
+Filter the current spans down to those carrying a given span attribute, so subsequent chained assertions operate on the matching subset. When `value` is omitted, only the presence of the attribute is checked.
+
+| Method | Description |
+|---|---|
+| `has_attribute(attribute_name, expected=None)` | Assert at least one span carries the attribute `attribute_name` (optionally equal to `expected`); narrows context to matching spans (`key`/`value` accepted as legacy aliases) |
+| `does_not_have_attribute(attribute_name, expected=None)` | Assert no span carries the attribute `attribute_name` (optionally equal to `expected`) (`key`/`value` accepted as legacy aliases) |
+| `has_event(event_name, attribute_name=None, expected=None)` | Assert at least one span has an event named `event_name` (optionally carrying attribute `attribute_name`, optionally equal to `expected`); narrows context to matching spans |
+| `where(attribute=None, event=None, predicate=None)` | Generic selector: narrow context to spans matching **all** given criteria — `attribute` (`{name: expected}` mapping), `event` (`{"name":..., "attributes":{...}}`), and/or `predicate` (`Callable[[Span], bool]`). `has_attribute`/`has_event` are wrappers over this. |
+| `does_not_match(attribute=None, event=None, predicate=None)` | Assert no span matches all the given criteria (same arguments as `where`) |
+
+### Scope assertions
+
+Assert on monocle scope values attached to the current spans. `has_*`/`contains_*` narrow the context to matching spans. When the value/values argument is omitted on `has_scope`/`does_not_have_scope`, only presence/absence of the scope is checked.
+
+| Method | Description |
+|---|---|
+| `has_scope(scope_name, expected_value=None)` | Assert a span has the scope (optionally equal to `expected_value`) |
+| `has_any_scope(scope_name, *expected_values)` | Assert a span has the scope with any of the given values |
+| `does_not_have_scope(scope_name, unexpected_value=None)` | Assert no span has the scope (optionally with `unexpected_value`) |
+| `does_not_have_any_scope(scope_name, *unexpected_values)` | Assert no span has the scope with any of the given values |
+| `contains_scope(scope_name, expected_substring)` | Assert the scope value contains the substring |
+| `contains_any_scope(scope_name, *expected_substrings)` | Assert the scope value contains any of the substrings |
+| `does_not_contain_scope(scope_name, unexpected_substring)` | Assert the scope value does not contain the substring |
+| `does_not_contain_any_scope(scope_name, *unexpected_substrings)` | Assert the scope value does not contain any of the substrings |
+
 ### Performance assertions
 
 | Method | Description |
@@ -704,11 +1232,12 @@ The `monocle_trace_asserter` fixture provides a `TraceAssertion` instance. All a
 
 ### Evaluation
 
+Configure the evaluator with `with_evaluation` (see the Configuration table) before calling `check_eval`. Note: `with_comparer` overrides the comparer for `has_*` assertions but does **not** affect `contains_*` methods (those always use token/substring matching).
+
 | Method | Description |
 |---|---|
-| `with_evaluation(eval, eval_options=None)` | Configure the evaluator (`"okahu"`, `"bert_score"`, or a `BaseEval` instance) |
-| `with_comparer(comparer)` | Override the comparer used by subsequent `has_input`, `has_any_input`, `does_not_have_input`, `has_output`, `has_any_output`, `does_not_have_output` assertions. Does **not** affect `contains_*` methods (those always use token/substring matching). Accepts a string key or class instance: `"default"` (exact match), `"similarity"` (semantic via sentence-transformers, threshold 0.8), `"bert_score"` (BERTScore similarity), `"metric"` (numeric metric comparison), `"token_match"` (substring containment), or any `BaseComparer` subclass instance. |
-| `check_eval(eval_name, expected=None, not_expected=None, fact_name="traces")` | Run an evaluation and assert the result. `expected` and `not_expected` each accept a string or list of strings |
+| `check_eval(eval_name=None, expected=None, not_expected=None, fact_name="traces", template_path=None, *, template=None, min_facts=1, fail_threshold=0, max_facts=None)` | Run an evaluation and assert the result. Provide **exactly one** of `eval_name` (a standard Okahu template name, or a path to a custom-template JSON file — detected from the value), `template_path` (a custom-template JSON file), or `template` (an inline custom-template dict). `expected`/`not_expected` each accept a string or list of strings. `min_facts`/`fail_threshold`/`max_facts` apply **only** in time-window (filtered) mode (see [Time-window evaluation](#time-window-filtered-evaluation)) and raise otherwise |
+| `get_eval_report()` / `get_eval_failures()` / `write_eval_report(path)` | Read the report stashed by the last `check_eval` — the full report dict, the non-`pass` scenarios, or write it to JSON. Same shape in single-fact and filtered modes |
 
 ---
 
@@ -745,6 +1274,8 @@ validator.check_duration_limits(max_duration=30.0, units="seconds", span_type="w
 | `MONOCLE_TRACE_OUTPUT_PATH` | Directory for file-based trace output | `.monocle/test_traces` |
 | `OKAHU_API_KEY` | API key for Okahu evaluation and trace export | — |
 | `OKAHU_EVALUATION_ENDPOINT` | Override the Okahu evaluation endpoint | `https://eval.okahu.co/api` |
+| `OKAHU_MAX_FACTS` | Runaway guard for time-window (filtered) evals: fail loudly if a filter discovers more than this many facts (see [Time-window evaluation](#time-window-filtered-evaluation)) | `1000` |
+| `MONOCLE_EVAL_MATRIX` | Set (to any value, optionally a path) to enable the opt-in eval-result-matrix recorder (see [Eval result matrix](#eval-result-matrix)). Off when unset | unset (off) |
 | `LOCAL_RUN_ID` | Run identifier applied to all spans in a session | ISO datetime at session start |
 
 ---

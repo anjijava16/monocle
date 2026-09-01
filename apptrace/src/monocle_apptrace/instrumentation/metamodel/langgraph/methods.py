@@ -1,8 +1,8 @@
-from monocle_apptrace.instrumentation.common.wrapper import task_wrapper, atask_wrapper, atask_iter_wrapper
+from monocle_apptrace.instrumentation.common.wrapper import task_wrapper, atask_wrapper, atask_iter_wrapper, task_iter_wrapper
+from monocle_apptrace.instrumentation.common.constants import AGENT_INVOCATION_SPAN_NAME
 from monocle_apptrace.instrumentation.metamodel.langgraph.entities.inference import (
     AGENT,
     AGENT_STREAM,
-    AGENT_REQUEST_STREAM,
     TOOLS,
 )
 
@@ -13,7 +13,7 @@ LANGGRAPH_METHODS = [
         "method": "invoke",
         "wrapper_method": task_wrapper,
         "span_handler": "langgraph_agent_handler",
-        "scope_name": "agent.invocation",
+        "scope_name": AGENT_INVOCATION_SPAN_NAME,
         "output_processor": AGENT,
     },
     {
@@ -22,7 +22,7 @@ LANGGRAPH_METHODS = [
         "method": "ainvoke",
         "wrapper_method": atask_wrapper,
         "span_handler": "langgraph_agent_handler",
-        "scope_name": "agent.invocation",
+        "scope_name": AGENT_INVOCATION_SPAN_NAME,
         "output_processor": AGENT,
     },
     {
@@ -31,17 +31,17 @@ LANGGRAPH_METHODS = [
         "method": "astream",
         "wrapper_method": atask_iter_wrapper,
         "span_handler": "langgraph_agent_handler",
-        "scope_name": "agent.invocation",
-        "output_processor_list": [AGENT_REQUEST_STREAM, AGENT_STREAM],
+        "scope_name": AGENT_INVOCATION_SPAN_NAME,
+        "output_processor": AGENT_STREAM,
     },
     {
         "package": "langgraph.graph.state",
         "object": "CompiledStateGraph",
         "method": "stream",
-        "wrapper_method": task_wrapper,
+        "wrapper_method": task_iter_wrapper,
         "span_handler": "langgraph_agent_handler",
-        "scope_name": "agent.invocation",
-        "output_processor_list": [AGENT_REQUEST_STREAM, AGENT_STREAM],
+        "scope_name": AGENT_INVOCATION_SPAN_NAME,
+        "output_processor": AGENT_STREAM,
     },
     {
         "package": "langgraph.graph.state",
@@ -49,7 +49,7 @@ LANGGRAPH_METHODS = [
         "method": "astream_events",
         "wrapper_method": atask_iter_wrapper,
         "span_handler": "langgraph_agent_handler",
-        "scope_name": "agent.invocation",
+        "scope_name": AGENT_INVOCATION_SPAN_NAME,
         "output_processor": AGENT,
     },
     {

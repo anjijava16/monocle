@@ -1,4 +1,8 @@
 MONOCLE_WORKFLOW_NAME_KEY = "_monocle.workflow_name"
+
+# We set a higher default of 50KB to accommodate large responses
+DEFAULT_MAX_ATTRIBUTE_LENGTH = 51200  # 50KB
+
 # Azure environment constants
 AZURE_ML_ENDPOINT_ENV_NAME = "AZUREML_ENTRY_SCRIPT"
 AZURE_FUNCTION_WORKER_ENV_NAME = "FUNCTIONS_WORKER_RUNTIME"
@@ -13,6 +17,8 @@ GITHUB_CODESPACE_IDENTIFIER_ENV_NAME = "GITHUB_REPOSITORY"
 AGENTCORE_ENV_NAME = "AGENTCORE_RUNTIME_URL"
 AZURE_FOUNDRY_PROJECT_ENDPOINT_ENV_NAME = "PROJECT_ENDPOINT"
 AZURE_FOUNDRY_ALT_PROJECT_ENDPOINT_ENV_NAME = "AZURE_AI_PROJECT_ENDPOINT"
+# The name agent-framework-foundry's own samples and FoundryChatClient callers use.
+AZURE_FOUNDRY_SDK_PROJECT_ENDPOINT_ENV_NAME = "FOUNDRY_PROJECT_ENDPOINT"
 
 # Azure naming reference can be found here
 # https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/resource-abbreviations
@@ -35,6 +41,7 @@ service_type_map = {
     AGENTCORE_ENV_NAME: AWS_AGENTCORE_SERVICE_NAME,
     AZURE_FOUNDRY_PROJECT_ENDPOINT_ENV_NAME: AZURE_FOUNDRY_SERVICE_NAME,
     AZURE_FOUNDRY_ALT_PROJECT_ENDPOINT_ENV_NAME: AZURE_FOUNDRY_SERVICE_NAME,
+    AZURE_FOUNDRY_SDK_PROJECT_ENDPOINT_ENV_NAME: AZURE_FOUNDRY_SERVICE_NAME,
 }
 
 # Env variables to identify infra service name
@@ -59,6 +66,8 @@ llm_type_map = {
     "sagemakerllm": "aws_sagemaker",
     "chatbedrock": "aws_bedrock",
     "openaigenerator": "openai",
+    "openaichatgenerator": "openai",
+    "azureopenaichatgenerator": "azure_openai",
     "bedrockruntime": "aws_bedrock",
     "sagemakerruntime": "aws_sagemaker",
     "anthropic": "anthropic",
@@ -86,6 +95,7 @@ DATA_INPUT_KEY = "data.input"
 DATA_OUTPUT_KEY = "data.output"
 PROMPT_INPUT_KEY = "data.input"
 PROMPT_OUTPUT_KEY = "data.output"
+SPAN_TYPE_KEY = "span.type"
 QUERY = "input"
 RESPONSE = "response"
 SESSION_PROPERTIES_KEY = "session"
@@ -109,6 +119,21 @@ HTTP_SUCCESS_CODES = ("200", "201", "202", "204", "205", "206")
 CHILD_ERROR_CODE = "child.error.code"
 HEALTH_RESET_COUNTER = 100
 HTTP_HEALTH_CHECK_METHODS = ["get", "head"]
+# Well known health check routes. A route matches when it equals one of these or ends
+# with it, eg /actuator/health.
+HTTP_HEALTH_CHECK_ROUTES = [
+    "/health",
+    "/healthz",
+    "/healthcheck",
+    "/health-check",
+    "/livez",
+    "/liveness",
+    "/readyz",
+    "/readiness",
+    "/ping",
+    "/_health",
+]
+HTTP_HEALTH_CHECK_ROUTES_ENV = "MONOCLE_HEALTH_CHECK_ROUTES"
 
 AGENT_PREFIX_KEY = "monocle.agent.prefix"
 AGENT_NAME_KEY = "monocle.agent.name"
@@ -255,3 +280,19 @@ PROVIDER_BASE_URLS = {
 
 SPAN_START_TIME:str = "monocle_span_start_time"
 SPAN_END_TIME:str = "monocle_span_end_time"
+
+# HTTP response span piggyback (trace return)
+MONOCLE_TRACE_RETURN_ENABLED_ENV = "MONOCLE_ENABLE_TRACE_RETURN"
+TRACE_RETURN_REQUEST_HEADER = "x-monocle-retrieve-traces"
+TRACE_RETURN_RESPONSE_HEADER = "x-monocle-traces"
+TRACE_RETURN_SCOPE_NAME = "monocle_trace_return"
+TRACE_RETURN_VERSION = "v1"
+
+# Trace-retrieval authorization
+MONOCLE_TRACE_RETRIEVAL_CALLBACK_ENV = "MONOCLE_TRACE_RETRIEVAL_CALLBACK"
+MONOCLE_TRACE_RETRIEVAL_DEFAULT_KEY_ENV = "MONOCLE_TRACE_RETRIEVAL_DEFAULT_KEY"
+MONOCLE_TRACE_RETRIEVAL_KEY_ENV = "MONOCLE_TRACE_RETRIEVAL_KEY"
+
+# AgentCore forwards a caller's headers to the agent only when they carry this
+# prefix, so the retrieval key travels as
+AGENTCORE_CUSTOM_HEADER_PREFIX = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-"

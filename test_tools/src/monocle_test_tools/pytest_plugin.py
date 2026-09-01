@@ -2,6 +2,54 @@ import os
 from datetime import datetime
 import pytest
 from .fluent_api import TraceAssertion
+from .testcase import FluentTestCase
+from . import eval_matrix
+
+
+def pytest_addoption(parser) -> None:
+    """Register the opt-in --monocle-eval-matrix option.
+
+    See `eval_matrix.py` for the recorder implementation. Off by default:
+    a plain `pytest` invocation with neither this flag nor the
+    MONOCLE_EVAL_MATRIX env var set records nothing and writes no file.
+    """
+    eval_matrix.pytest_addoption(parser)
+
+
+def pytest_sessionfinish(session) -> None:
+    """If the eval-result-matrix recorder is enabled, write the collected
+    records to the resolved output path."""
+    eval_matrix.pytest_sessionfinish(session)
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    """Name a parametrized test case after itself rather than its index.
+
+    A suite built by ``setup_test_cases()`` is one test function over many cases,
+    so the default ids (``testcase0``, ``testcase1``, ...) leave a failure
+    saying nothing about *which* fact broke. Returning the case's own name makes
+    the node id ``test_something[<fact id or case name>]``, which is also what
+    you paste back to re-run just that case.
+
+    This only supplies the bracketed part -- pytest prefixes the test function
+    name itself.
+
+    A ``FluentTestCase`` is named by its ``name`` whatever the argument is
+    called, since the type is unambiguous. A plain dict is only named when the
+    argument is called ``testcase``: without that gate, any unrelated test
+    parametrizing over dicts with a ``"name"`` key would silently get new node
+    ids, breaking anything that matches on them.
+
+    Returns None for everything else, which leaves pytest's own id generation
+    untouched.
+    """
+    if isinstance(val, FluentTestCase):
+        name = val.name
+    elif isinstance(val, dict) and argname == "testcase":
+        name = val.get("name")
+    else:
+        return None
+    return str(name) if name is not None else None
 
 @pytest.fixture(scope="session", autouse=True)
 def run_once_at_start_of_session():
@@ -78,7 +126,11 @@ def monocle_trace_asserter(request:pytest.FixtureRequest):
             assertion_messages = None
         traceAssertion.validator.post_test_cleanup(token, request.node.name, is_test_failed,
                                     assertion_messages, skip_export=traceAssertion._skip_export)
-        
+
+        # Opt-in eval-result-matrix recorder: self-skips when disabled, or
+        # when this test never called check_eval (no `_last_eval` stash).
+        eval_matrix.record_eval_row_for(request.config, request, traceAssertion)
+
         # Cleanup trace asserter (triggers eval cleanup including trace deletion)
         traceAssertion.cleanup()
 
@@ -99,7 +151,7 @@ def pytest_runtest_makereport(item, call):
 
             rep.longrepr = traceAssertion.get_assertion_messages()
 
-
 def _is_test_failed(request:pytest.FixtureRequest) -> bool:
     """Check if the test has failed based on the pytest request object."""
     return request.node.rep_call.passed == False if hasattr(request.node, "rep_call") else False
+

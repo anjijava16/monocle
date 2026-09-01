@@ -22,10 +22,11 @@ from pydantic import BaseModel, ValidationError
 from monocle_test_tools.file_span_loader import JSONSpanLoader
 from monocle_test_tools.gitutils import get_git_context, get_repo_name
 from monocle_test_tools.okahu_span_loader import OkahuSpanLoader
-from monocle_test_tools.schema import SpanType, TestSpan, TestCase, Evaluation, EvalInputs, MockTool
-from monocle_test_tools.constants import TEST_SCOPE_NAME, DEFAULT_WORKFLOW_NAME, TEST_STATUS_ATTRIBUTE, TEST_ASSERTION_ATTRIBUTE, TEST_WORKFLOW_ENV
+from monocle_test_tools.schema import SpanType, TestSpan, TestCase, MultiTurnTestCase, Evaluation, EvalInputs, MockTool
+from monocle_test_tools.constants import TEST_SCOPE_NAME, SESSION_SCOPE_NAME, TURN_SCOPE_NAME, DEFAULT_WORKFLOW_NAME, TEST_STATUS_ATTRIBUTE, TEST_ASSERTION_ATTRIBUTE, TEST_WORKFLOW_ENV
 from monocle_test_tools.comparer.base_comparer import BaseComparer
 from monocle_test_tools.runner.runner import get_agent_runner
+from monocle_test_tools.trace_sources import get_trace_source
 from monocle_test_tools import trace_utils
 from monocle_apptrace.instrumentation.metamodel.adk.methods import ADK_METHODS
 from monocle_apptrace.instrumentation.metamodel.adk.entities.tool import TOOL as ADK_TOOL
@@ -36,6 +37,9 @@ from monocle_apptrace.instrumentation.common.utils import set_workflow_name, get
 
 logger = logging.getLogger(__name__)
 RETRY_TIMEOUT_SECONDS = 10
+# Spans a runner produced in another process are exported by that process, so
+# they land in the trace backend a little after the call returns.
+REMOTE_FACT_TIMEOUT_SECONDS = int(os.getenv("MONOCLE_REMOTE_TRACE_TIMEOUT", "60"))
 
 class MonocleValidator:
     memory_exporter:MonocleInMemorySpanExporter = None
@@ -62,6 +66,15 @@ class MonocleValidator:
         self._spans:tuple[Span] = ()
         self._test_all_up_spans:tuple[Span] = ()
         self._trace_source: str = ""
+        # Details of the fact whose spans were loaded from a remote trace source,
+        # captured in import_traces and used to record the test outcome back to
+        # the source during post_test_cleanup.
+        self._trace_source_fact_id: Optional[str] = None
+        self._trace_source_fact_name: Optional[str] = None
+        self._trace_source_workflow_name: Optional[str] = None
+        # Per-session run_agent_async count, used to default an unset turn_id to
+        # the next 1-based turn index for that session. Reset per test.
+        self._session_turn_counters: dict[str, int] = {}
         test_trace_path:str = os.path.join(".", DEFAULT_TRACE_FOLDER, "test_traces")
         os.environ["MONOCLE_TRACE_OUTPUT_PATH"] = test_trace_path
         if exporter_list is None:
@@ -100,6 +113,10 @@ class MonocleValidator:
         if self.file_exporter is not None:
             self.file_exporter.force_flush()
         self.trace_id = None
+        self._trace_source_fact_id = None
+        self._trace_source_fact_name = None
+        self._trace_source_workflow_name = None
+        self._session_turn_counters = {}
 
     @property
     def spans(self):
@@ -161,15 +178,58 @@ class MonocleValidator:
         token = start_scopes(all_scopes, context)
         return token
 
+    def pre_multi_turn_setup(self, test_case_name: str, session_id: str) -> object:
+        """Prepare the validator for a multi-turn run.
+
+        Starts a scope that carries both the test name and a shared session id,
+        so every span produced across all turns is grouped under one
+        ``scope.session_id`` attribute. Per-turn mock tools are applied inside
+        each turn's run (see ``run_multi_turn_agent_async``), so they are not set
+        here. Returns the scope token to stop once the run finishes.
+        """
+        session_scope = {TEST_SCOPE_NAME: test_case_name, SESSION_SCOPE_NAME: session_id}
+        git_scopes = get_git_context()
+        all_scopes = {**session_scope, **git_scopes}
+        token = start_scopes(all_scopes)
+        return token
+
     def post_test_cleanup(self, token:object, test_name:str, test_failed:bool,
                         test_assertion_message:str = None, skip_export:bool = False) -> None:
         try:
             if not skip_export:
                 self.flush_to_exporters(test_name, test_failed, test_assertion_message)
+            self._maybe_record_test_result(test_name, test_failed, test_assertion_message)
         finally:
             self.cleanup()
             if token is not None:
                 stop_scope(token)
+
+    def _maybe_record_test_result(self, test_name:str, test_failed:bool, description:str) -> None:
+        """Record the test outcome back to the trace source, when supported.
+
+        Resolves the current trace source (only Okahu records today) and asks it
+        to record a label for this test. Fully best-effort: it never raises, so
+        it cannot fail the test or mask its real result. Must run before
+        ``cleanup()`` clears the captured fact details.
+        """
+        try:
+            trace_source = get_trace_source(self._trace_source)
+            if trace_source is None:
+                return
+            fact_id = self._trace_source_fact_id or self._get_current_trace_id()
+            fact_name = self._trace_source_fact_name or "traces"
+            workflow_name = self._trace_source_workflow_name or get_workflow_name()
+            trace_source.record_test_result(
+                fact_id=fact_id,
+                fact_name=fact_name,
+                workflow_name=workflow_name,
+                test_name=test_name,
+                test_failed=test_failed,
+                exporters=self.exporters,
+                description=description
+            )
+        except Exception as exc:
+            logger.warning("Failed to record test result: %s", exc)
 
     @contextmanager
     def monocle_exporter_wrapper(self, test_case: TestCase, request:pytest.FixtureRequest):
@@ -203,6 +263,41 @@ class MonocleValidator:
     def test_id_generator(val):
         return f"{val.test_name}_{uuid.uuid4().hex[:8]}"
 
+    @asynccontextmanager
+    async def monocle_multi_turn_wrapper(self, multi_turn_case: MultiTurnTestCase, request: pytest.FixtureRequest):
+        """Scope + export lifecycle for a multi-turn test.
+
+        Assigns a shared session id (auto-generated when the case doesn't set
+        one), starts a scope carrying both the test name and that session id so
+        every turn's spans are grouped under one ``scope.session_id``, yields to
+        the test body (which drives the turns and runs per-turn / session
+        assertions), then exports the accumulated spans and cleans up. Unlike the
+        single-turn wrapper it does not call ``validate`` itself, because
+        per-turn span slicing and session validation are done inside
+        ``test_multi_turn_agent_async`` where the per-turn spans are available.
+        """
+        test_case_name = request.node.name if request is not None else multi_turn_case.test_name
+        if multi_turn_case.session_id is None:
+            multi_turn_case.session_id = f"monocle_test_session_{uuid.uuid4().hex}"
+        token = self.pre_multi_turn_setup(test_case_name, multi_turn_case.session_id)
+        prior_test_failed_count = request.session.testsfailed if request is not None else 0
+        validation_failed = False
+        validation_error_message = None
+        try:
+            yield
+        except Exception as e:
+            validation_failed = True
+            validation_error_message = str(e)
+            raise
+        finally:
+            test_failed = validation_failed or (
+                request is not None and request.session.testsfailed > prior_test_failed_count
+            )
+            test_name = request.node.name if request is not None else test_case_name
+            self.post_test_cleanup(token, test_name, test_failed, validation_error_message)
+            if token is not None:
+                stop_scope(token)
+
     def monocle_testcase(self, test_cases_array: list[Union[TestCase, dict]]):
         test_cases: list[TestCase] = []
         for tc in test_cases_array:
@@ -223,6 +318,34 @@ class MonocleValidator:
                 def wrapper(test_case, request, *args, **kwargs):
                     with self.monocle_exporter_wrapper(test_case, request):
                         return func(test_case, *args, **kwargs)
+            return wrapper
+        return decorator
+
+    def monocle_multi_turn_testcase(self, multi_turn_cases_array: list[Union[MultiTurnTestCase, dict]]):
+        """Decorator to parametrize a test function over multi-turn test cases.
+
+        Mirrors ``monocle_testcase`` but for ``MultiTurnTestCase`` inputs. Each
+        case is run inside ``monocle_multi_turn_wrapper`` so the shared session
+        scope and span export are handled automatically; the decorated test body
+        typically just awaits ``test_multi_turn_agent_async``. The decorated
+        function must be a coroutine, since multi-turn runs are async.
+        """
+        multi_turn_cases: list[MultiTurnTestCase] = []
+        for mtc in multi_turn_cases_array:
+            if isinstance(mtc, dict):
+                multi_turn_cases.append(MultiTurnTestCase.model_validate(mtc))
+            else:
+                multi_turn_cases.append(mtc)
+
+        def decorator(func):
+            if not inspect.iscoroutinefunction(func):
+                raise ValueError("monocle_multi_turn_testcase can only decorate async test functions.")
+
+            @pytest.mark.asyncio
+            @pytest.mark.parametrize("multi_turn_case", multi_turn_cases)
+            async def wrapper(multi_turn_case, request, *args, **kwargs):
+                async with self.monocle_multi_turn_wrapper(multi_turn_case, request):
+                    return await func(multi_turn_case, *args, **kwargs)
             return wrapper
         return decorator
 
@@ -277,15 +400,25 @@ class MonocleValidator:
             if mock_tool_token is not None:
                 detach(mock_tool_token)
         self._trace_source =  agent_runner.get_remote_traces_source()
-        self._fetch_remote_traces()
+        self._fetch_remote_traces(**agent_runner.get_remote_trace_query())
+        remote_spans = agent_runner.get_remote_spans()
+        if remote_spans:
+            self.add_remote_spans(remote_spans)
         return result
 
-    async def run_agent_async(self, agent, agent_type:str, *args, session_id:str=None, mock_tools:list[MockTool]=[], **kwargs):
+    async def run_agent_async(self, agent, agent_type:str, *args, session_id:str=None, turn_id:str=None, mock_tools:list[MockTool]=[], **kwargs):
         self.clear_spans()
         agent_runner = get_agent_runner(agent_type)
         if agent_runner is None:
             raise ValueError(f"Unsupported agent type: {agent_type}")
         mock_tool_token = None
+        # Unset turn_id defaults to the next 1-based turn index for this session
+        # (tags scope.turn_id on repeated run_agent_async calls). No session_id
+        # means a single turn, left untagged.
+        if turn_id is None and session_id is not None:
+            self._session_turn_counters[session_id] = self._session_turn_counters.get(session_id, 0) + 1
+            turn_id = str(self._session_turn_counters[session_id])
+        turn_token = start_scopes({TURN_SCOPE_NAME: turn_id}) if turn_id is not None else None
         try:
             context = self._set_wrapper_methods(mock_tools)
             if context is not None:
@@ -294,8 +427,13 @@ class MonocleValidator:
         finally:
             if mock_tool_token is not None:
                 detach(mock_tool_token)
+            if turn_token is not None:
+                stop_scope(turn_token)
         self._trace_source = agent_runner.get_remote_traces_source()
-        self._fetch_remote_traces()
+        self._fetch_remote_traces(**agent_runner.get_remote_trace_query())
+        remote_spans = agent_runner.get_remote_spans()
+        if remote_spans:
+            self.add_remote_spans(remote_spans)
         return result
 
     async def test_agent_async(self, agent, agent_type:str, test_case:Union[TestCase, dict], session_id:str=None):
@@ -322,15 +460,164 @@ class MonocleValidator:
         self.validate_result(test_case, result)
         return result
 
-    def _fetch_remote_traces(self):
+    @staticmethod
+    def _chain_turn_input(test_input, previous_output):
+        """Substitute the previous turn's output into a turn's input.
+
+        Any string element of ``test_input`` that contains the
+        ``{previous_output}`` placeholder is formatted with the prior turn's
+        result, so the output of turn n can inform the input of turn n+1. Turns
+        that don't use the placeholder are returned unchanged.
+        """
+        if test_input is None or previous_output is None:
+            return test_input
+        chained = []
+        for item in test_input:
+            if isinstance(item, str) and "{previous_output}" in item:
+                chained.append(item.replace("{previous_output}", str(previous_output)))
+            else:
+                chained.append(item)
+        return tuple(chained)
+
+    async def run_multi_turn_agent_async(self, agent, agent_type: str, multi_turn_case: MultiTurnTestCase):
+        """Run every turn of a multi-turn case against one live agent session.
+
+        A single agent runner instance is reused across all turns and the same
+        ``session_id`` is threaded into every turn, so the agent's own memory
+        persists between turns (this is what lets an "incomplete input -> agent
+        asks for clarification -> follow-up input" flow work end to end). Spans
+        are accumulated across turns instead of being cleared, so both per-turn
+        and session-wide assertions have the spans they need.
+
+        Every turn also runs inside its own ``turn_id`` scope (nested under the
+        shared session scope), so each span a turn produces carries a
+        ``scope.turn_id`` attribute in addition to ``scope.session_id``. The turn
+        id is the turn's own ``turn_id`` when set, otherwise its 1-based index;
+        this keeps turns filterable and assertable both in-memory and in exported
+        traces.
+
+        Returns a tuple of ``(per_turn_spans, results, turn_ids)`` where
+        ``per_turn_spans`` is a list holding the spans produced by each turn (in
+        order), ``results`` is the list of per-turn results and ``turn_ids`` is
+        the list of resolved turn ids (same order).
+        """
+        agent_runner = get_agent_runner(agent_type)
+        if agent_runner is None:
+            raise ValueError(f"Unsupported agent type: {agent_type}")
+
+        session_id = multi_turn_case.session_id
+        per_turn_spans: list[tuple] = []
+        results: list = []
+        turn_ids: list = []
+        previous_output = None
+
+        try:
+            for index, turn in enumerate(multi_turn_case.turns, start=1):
+                self.clear_spans()
+                turn_id = turn.turn_id if turn.turn_id is not None else str(index)
+                turn.turn_id = turn_id  
+                turn_token = start_scopes({TURN_SCOPE_NAME: turn_id})
+                mock_tool_token = None
+                turn_input = self._chain_turn_input(turn.test_input, previous_output)
+                try:
+                    context = self._set_wrapper_methods(turn.mock_tools or [])
+                    if context is not None:
+                        mock_tool_token = attach(context)
+                    result = None
+                    try:
+                        result = await agent_runner.run_agent_async(
+                            agent, *turn_input, session_id=session_id
+                        )
+                    except Exception:
+                        if not (turn.expect_errors or multi_turn_case.expect_errors):
+                            raise
+                finally:
+                    if mock_tool_token is not None:
+                        detach(mock_tool_token)
+                    if turn_token is not None:
+                        stop_scope(turn_token)
+
+                self._trace_source = agent_runner.get_remote_traces_source()
+                self._fetch_remote_traces(**agent_runner.get_remote_trace_query())
+                turn_spans = self.spans
+                per_turn_spans.append(turn_spans)
+                results.append(result)
+                turn_ids.append(turn_id)
+                previous_output = result
+        finally:
+            if hasattr(agent_runner, "end_session"):
+                try:
+                    await agent_runner.end_session(session_id)
+                except Exception as e:
+                    logger.debug(f"end_session cleanup failed: {e}")
+
+        return per_turn_spans, results, turn_ids
+
+    async def test_multi_turn_agent_async(self, agent, agent_type: str,
+                                          multi_turn_case: Union[MultiTurnTestCase, dict]):
+        """Run a multi-turn test case and validate per-turn and session assertions.
+
+        Runs every turn in order against a shared live session, validates each
+        turn's own assertions (``test_output``, ``test_spans``) against that
+        turn's spans, then validates the session-level ``session_spans`` and
+        ``session_output`` against the spans accumulated across all turns.
+        """
+        if isinstance(multi_turn_case, dict):
+            multi_turn_case = MultiTurnTestCase.model_validate(multi_turn_case)
+        if multi_turn_case.session_id is None:
+            multi_turn_case.session_id = f"monocle_test_session_{uuid.uuid4().hex}"
+
+        per_turn_spans, results, _turn_ids = await self.run_multi_turn_agent_async(
+            agent, agent_type, multi_turn_case
+        )
+
+        for turn, turn_spans, result in zip(multi_turn_case.turns, per_turn_spans, results):
+            self._spans = tuple(turn_spans)
+            self.validate(turn)
+            self.validate_result(turn, result)
+
+        self._spans = tuple(self._test_all_up_spans)
+        session_case = TestCase(
+            test_name=multi_turn_case.test_name,
+            test_output=multi_turn_case.session_output,
+            comparer=multi_turn_case.comparer,
+            test_spans=multi_turn_case.session_spans,
+            expect_errors=multi_turn_case.expect_errors,
+            expect_warnings=multi_turn_case.expect_warnings,
+        )
+        self.validate(session_case)
+        if multi_turn_case.session_output is not None:
+            self.validate_result(session_case, results[-1] if results else None)
+        return results
+
+    def _fetch_remote_traces(self, **query):
+        """Import the spans this run produced remotely.
+
+        ``query`` comes from the runner's ``get_remote_trace_query()`` and names
+        the fact identifying those spans. When it is empty the trace id is
+        resolved from the local spans, which is the original behaviour.
+
+        Spans exported from another process reach the backend a little after the
+        call returns, so a fact-based lookup polls for longer than the trace-id
+        lookup and also retries the "not found yet" ConnectionError that the
+        span loader raises while they are still in flight.
+        """
         import time
-        deadline = time.monotonic() + RETRY_TIMEOUT_SECONDS
+        deadline = time.monotonic() + (REMOTE_FACT_TIMEOUT_SECONDS if query else RETRY_TIMEOUT_SECONDS)
         last_exc = None
         while time.monotonic() < deadline:
             try:
-                self.import_traces(self._trace_source)
+                self.import_traces(self._trace_source, **query)
                 return
             except requests.exceptions.HTTPError | requests.HTTPError as e:
+                time.sleep(1)
+                last_exc = e
+            except ConnectionError as e:
+                # Raised by the span loader while the remote spans are still in
+                # flight. Only a fact lookup can wait that out; without a query
+                # the original behaviour of surfacing it immediately is kept.
+                if not query:
+                    raise
                 time.sleep(1)
                 last_exc = e
             except ValueError as e:
@@ -342,7 +629,10 @@ class MonocleValidator:
                       trace_path: Optional[str] = None,
                       fact_name: Optional[str] = "trace",
                       scope_name: Optional[str] = None,
-                      workflow_name: Optional[str] = None) -> None:
+                      workflow_name: Optional[str] = None,
+                      load_spans: bool = True,
+                      start_time: Optional[str] = None,
+                      end_time: Optional[str] = None) -> list[Span]:
         """Import traces from a source for assertion.
 
         Loads previously exported trace spans into the asserter's memory
@@ -364,9 +654,20 @@ class MonocleValidator:
                 defaults to "agent_sessions".
             workflow_name: Okahu workflow / service name
                 (required when ``trace_source="okahu"``).
+            load_spans: When True (default) the fetched spans are loaded into the
+                validator for assertions and the trace source is recorded. When
+                False this is a pure fetch: the spans are returned and no
+                validator state is touched. Callers that only need the *content*
+                of a recorded trace -- replaying its input into a fresh run --
+                use False, so the source trace's fact id does not end up
+                attached to the new run's result.
+            start_time: Optional window start, narrowing the server-side lookup.
+                Okahu only -- a trace file holds one trace, so there is nothing
+                to narrow and passing it for the file source raises.
+            end_time: Optional window end, as above.
 
         Returns:
-            self for fluent chaining.
+            The fetched spans.
 
         Raises:
             ValueError: If arguments are invalid or incomplete.
@@ -417,27 +718,50 @@ class MonocleValidator:
 
             if fact_name == "session":
                 # Session-based: use agent_sessions scope
+                okahu_fact_name = OkahuSpanLoader.AGENT_SESSIONS_SCOPE
                 spans = OkahuSpanLoader.load_by_scope(
                     workflow_name=workflow_name,
-                    scope_name=OkahuSpanLoader.AGENT_SESSIONS_SCOPE,
+                    scope_name=okahu_fact_name,
                     scope_id=id,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
             elif fact_name == "scope":
                 # Custom scope: requires scope_name
                 if not scope_name:
                     raise ValueError("'scope_name' is required when fact_name='scope'.")
+                okahu_fact_name = scope_name
                 spans = OkahuSpanLoader.load_by_scope(
                     workflow_name=workflow_name,
-                    scope_name=scope_name,
+                    scope_name=okahu_fact_name,
                     scope_id=id,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
             else:
                 # Direct trace_id lookup
+                okahu_fact_name = "traces"
                 spans = OkahuSpanLoader.get_spans(
                     workflow_name=workflow_name,
                     trace_id=id,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
+            # Capture the fact details so the test outcome can be recorded back
+            # to Okahu during post_test_cleanup. Skipped for a pure fetch: those
+            # spans are not what the assertions will run against.
+            if load_spans:
+                self._trace_source_fact_id = id
+                self._trace_source_fact_name = okahu_fact_name
+                self._trace_source_workflow_name = workflow_name
         else:
+            # File source — a time window only filters a server-side query, so
+            # it is rejected here rather than silently ignored.
+            for _name, _value in (("start_time", start_time), ("end_time", end_time)):
+                if _value is not None:
+                    raise ValueError(
+                        f"'{_name}' is not supported for the file trace source; a "
+                        "time window only filters a server-side query.")
             # File source — fact_name must be "trace"
             if fact_name != "trace":
                 raise ValueError(
@@ -459,9 +783,10 @@ class MonocleValidator:
 
             spans = JSONSpanLoader.from_json(trace_file)
 
-        self.add_remote_spans(spans)
-        self._trace_source = trace_source
-        return None
+        if load_spans:
+            self.add_remote_spans(spans)
+            self._trace_source = trace_source
+        return spans
 
     def _get_current_trace_id(self) -> Optional[str]:
         """Helper to get the current trace ID from the validator's spans."""

@@ -11,7 +11,7 @@ from common.custom_exporter import CustomConsoleSpanExporter
 from datasets import load_dataset
 from haystack import Document, Pipeline
 from haystack.components.builders import PromptBuilder
-from haystack.components.generators import OpenAIGenerator
+from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.retrievers.in_memory import InMemoryEmbeddingRetriever
 from haystack.components.retrievers.in_memory.embedding_retriever import (
     InMemoryDocumentStore,
@@ -46,12 +46,12 @@ def cleanup_module():
     subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y","sentence-transformers"])
 
 def test_haystack_sample(setup):
-    from haystack.components.embedders import (
-        SentenceTransformersDocumentEmbedder,
-        SentenceTransformersTextEmbedder,
+    from haystack_integrations.components.embedders.sentence_transformers import (
+            SentenceTransformersDocumentEmbedder,
+            SentenceTransformersTextEmbedder,
     )
     api_key = os.getenv("OPENAI_API_KEY")
-    generator = OpenAIGenerator(
+    generator = OpenAIChatGenerator(
         api_key=Secret.from_token(api_key), model="gpt-4"
     )
     # api_key = os.getenv("MISTRAL_API_KEY")
@@ -190,7 +190,7 @@ def test_haystack_sample(setup):
 #     }
 # },
 # {
-#     "name": "haystack.components.generators.openai.OpenAIGenerator",
+#     "name": "haystack.components.generators.openai.OpenAIChatGenerator",
 #     "context": {
 #         "trace_id": "0x627bf88dcb4903b36ec8e1981d974e30",
 #         "span_id": "0xfca6cddc2de93669",

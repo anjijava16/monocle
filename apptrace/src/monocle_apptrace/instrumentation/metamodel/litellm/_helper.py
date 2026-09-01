@@ -19,6 +19,20 @@ from contextlib import suppress
 logger = logging.getLogger(__name__)
 
 
+def is_streaming_request(kwargs):
+    """Return True when LiteLLM completion request is configured for streaming."""
+    try:
+        if isinstance(kwargs, dict):
+            if kwargs.get("stream") is True:
+                return True
+            optional_params = kwargs.get("optional_params")
+            if isinstance(optional_params, dict) and optional_params.get("stream") is True:
+                return True
+    except Exception as e:
+        logger.warning("Warning: Error occurred in is_streaming_request: %s", str(e))
+    return False
+
+
 def extract_messages(kwargs):
     """Extract system and user messages"""
     try:
@@ -111,26 +125,78 @@ def extract_response_format(kwargs):
         return None
 
 
+def extract_temperature(kwargs):
+    """Extract the request `temperature` from LiteLLM kwargs.
+
+    Like `response_format`, generation params are not a top-level kwarg by the
+    time the instrumented provider backend is called: LiteLLM moves them into
+    `optional_params` (see `transform_request`, which spreads `**optional_params`
+    into the request body). Checks, in order:
+    1. optional_params["temperature"] — OpenAI/Azure sync and most providers.
+    2. data["temperature"] — Azure async, which passes an already-built request.
+    3. top-level kwargs["temperature"] — defensive fallback.
+
+    Returns None when no temperature was supplied (matching the convention of
+    the langchain/llamaindex/botocore/haystack metamodels).
+    """
+    try:
+        optional_params = kwargs.get("optional_params") or {}
+        if optional_params.get("temperature") is not None:
+            return optional_params["temperature"]
+
+        data = kwargs.get("data") or {}
+        if isinstance(data, dict) and data.get("temperature") is not None:
+            return data["temperature"]
+
+        return kwargs.get("temperature")
+    except Exception as e:
+        logger.warning("Warning: Error occurred in extract_temperature: %s", str(e))
+        return None
+
+
 def extract_assistant_message(arguments):
     try:
         messages = []
+        response = arguments["result"]
+
+        # Streaming path: SimpleNamespace from stream processor
+        if response is not None and hasattr(response, 'output_text'):
+            if hasattr(response, 'tools') and response.tools:
+                role = "assistant"
+                tool = response.tools[0]
+                messages.append({role: f'"tool_name": "{tool.get("name", "")}", "arguments": {tool.get("args", {})}'})
+            elif response.output_text:
+                role = getattr(response, 'role', 'assistant') or 'assistant'
+                messages.append({role: response.output_text})
+            return get_json_dumps(messages[0]) if messages else ""
+
+        # Non-streaming path
         status = get_status_code(arguments)
         if status == 'success' or status == 'completed':
-            response = arguments["result"]
             if (response is not None and hasattr(response, "choices") and len(response.choices) > 0):
                 if hasattr(response.choices[0], "message"):
-                    role = (
-                        response.choices[0].message.role
-                        if hasattr(response.choices[0].message, "role")
-                        else "assistant"
-                    )
-                    messages.append({role: response.choices[0].message.content})
+                    message = response.choices[0].message
+                    role = getattr(message, "role", None) or "assistant"
+                    # Tool-call responses carry null content; surface the tool
+                    # calls instead (mirrors the openai metamodel helper).
+                    if getattr(message, "tool_calls", None):
+                        tools = []
+                        for tool in message.tool_calls:
+                            function = getattr(tool, "function", None)
+                            tools.append({
+                                "tool_id": getattr(tool, "id", "") or "",
+                                "tool_name": getattr(function, "name", "") or "",
+                                "tool_arguments": getattr(function, "arguments", "") or "",
+                            })
+                        messages.append({role: tools})
+                    else:
+                        messages.append({role: message.content})
             return get_json_dumps(messages[0]) if messages else ""
         else:
             if arguments["exception"] is not None:
                 return get_exception_message(arguments)
-            elif hasattr(arguments["result"], "error"):
-                return arguments["result"].error
+            elif hasattr(response, "error"):
+                return response.error
 
     except (IndexError, AttributeError) as e:
         logger.warning(
@@ -156,7 +222,14 @@ def resolve_from_alias(my_map, alias):
 def update_span_from_llm_response(response):
     meta_dict = {}
     token_usage = None
+    
     if response is not None:
+        # Streaming path: SimpleNamespace with .usage dict
+        if hasattr(response, 'usage') and isinstance(response.usage, dict):
+            meta_dict.update(response.usage)
+            return meta_dict
+        
+        # Non-streaming path
         if token_usage is None and hasattr(response, "usage") and response.usage is not None:
             token_usage = response.usage
         elif token_usage is None and hasattr(response, "response_metadata"):
@@ -171,46 +244,64 @@ def update_span_from_llm_response(response):
 
 def agent_inference_type(arguments):
     """Extract agent inference type from LiteLLM response, following OpenAI pattern"""
-
-    finish_type = map_finish_reason_to_finish_type(extract_finish_reason(arguments))
+    finish_reason = extract_finish_reason(arguments)
+    finish_type = map_finish_reason_to_finish_type(finish_reason)
+    
     if finish_type == "tool_call":
         return INFERENCE_TOOL_CALL
 
     return INFERENCE_TURN_END
+
+def _extract_react_action_name(response):
+    """Return the tool name from a ReAct-style 'Action: <name>' text reply, or None.
+
+    Frameworks like CrewAI signal a tool call as text ("Action: <tool>") in
+    message.content instead of a native tool_calls entry, so both the
+    finish_reason and the tool name have to be parsed out of the same line.
+    """
+    with suppress(AttributeError, IndexError, TypeError):
+        if response is not None and hasattr(response, "choices") and len(response.choices) > 0:
+            message = getattr(response.choices[0], "message", None)
+            content = getattr(message, "content", None) if message is not None else None
+            if content:
+                content = str(content)
+                if "\nAction:" in content or "\naction:" in content:
+                    match = re.search(r'\n[Aa]ction:\s*([^\n]+)', content)
+                    if match:
+                        action = match.group(1).strip()
+                        # Filter out ReAct agent termination phrases to distinguish from actual tool calls:
+                        # - 'final answer': Used by ReAct agents to signal completion (e.g., "Action: Final Answer: <result>")
+                        # - 'i now know': Indicates the agent has gathered sufficient information to conclude
+                        # These patterns appear in frameworks like CrewAI that use text-based ReAct reasoning, where "Action:" is followed by either a tool name OR a termination signal.
+                        if action and not any(keyword in action.lower() for keyword in ['final answer', 'i now know']):
+                            return action
+    return None
 
 def extract_finish_reason(arguments):
     """Extract finish_reason from LiteLLM response"""
     try:
         if arguments.get("exception") is not None:
             return "error"
-            
+
         response = arguments.get("result")
-        
+
+        # Streaming path: SimpleNamespace with .finish_reason directly
+        if response is not None and hasattr(response, 'output_text') and hasattr(response, 'finish_reason'):
+            return response.finish_reason
+
         # Handle LiteLLM response structure (similar to OpenAI)
         if response is not None and hasattr(response, "choices") and len(response.choices) > 0:
             finish_reason = None
             if hasattr(response.choices[0], "finish_reason"):
                 finish_reason = response.choices[0].finish_reason
-            
+
             # Check if response contains ReAct-style tool calls (Action: tool_name pattern),frameworks like CrewAI that use text-based tool calling
             if finish_reason == "stop" and hasattr(response.choices[0], "message"):
-                message = response.choices[0].message
-                if hasattr(message, "content") and message.content:
-                    content = str(message.content)
-                    if "\nAction:" in content or "\naction:" in content:
-                        action_pattern = r'\n[Aa]ction:\s*([^\n]+)'
-                        match = re.search(action_pattern, content)
-                        if match:
-                            action = match.group(1).strip()
-                            # Filter out ReAct agent termination phrases to distinguish from actual tool calls:
-                            # - 'final answer': Used by ReAct agents to signal completion (e.g., "Action: Final Answer: <result>")
-                            # - 'i now know': Indicates the agent has gathered sufficient information to conclude
-                            # These patterns appear in frameworks like CrewAI that use text-based ReAct reasoning, where "Action:" is followed by either a tool name OR a termination signal.
-                            if action and not any(keyword in action.lower() for keyword in ['final answer', 'i now know']):
-                                return "tool_calls"
-            
+                if _extract_react_action_name(response) is not None:
+                    return "tool_calls"
+
             return finish_reason
-                
+
     except (IndexError, AttributeError) as e:
         logger.warning("Warning: Error occurred in extract_finish_reason: %s", str(e))
         return None
@@ -234,13 +325,21 @@ def _get_first_tool_call(response):
 def extract_tool_name(arguments):
     """Extract tool name from LiteLLM response when finish_type is tool_call"""
     try:
+        response = arguments.get("result")
+        
+        if response is not None and hasattr(response, 'tools') and response.tools:
+            if len(response.tools) > 0:
+                return response.tools[0].get("name")
+        
         finish_type = map_finish_reason_to_finish_type(extract_finish_reason(arguments))
         if finish_type != "tool_call":
             return None
 
-        tool_call = _get_first_tool_call(arguments["result"])
+        tool_call = _get_first_tool_call(response)
         if not tool_call:
-            return None
+            # No native tool_calls entry: fall back to the ReAct-style
+            # "Action: <tool>" text that made finish_type resolve to tool_call.
+            return _extract_react_action_name(response)
 
         # Try different name extraction approaches
         for getter in [
@@ -260,15 +359,103 @@ def extract_tool_name(arguments):
 def extract_tool_type(arguments):
     """Extract tool type from LiteLLM response when finish_type is tool_call"""
     try:
-        finish_type = map_finish_reason_to_finish_type(extract_finish_reason(arguments))
-        if finish_type != "tool_call":
-            return None
-
         tool_name = extract_tool_name(arguments)
         if tool_name:
             return TOOL_TYPE
 
     except Exception as e:
         logger.warning("Warning: Error occurred in extract_tool_type: %s", str(e))
-    
+
     return None
+
+
+# --- OpenAI Responses API (litellm.responses / aresponses) --------------------
+# gpt-5 / o-series models route through litellm's raw-httpx response handler,
+# which the chat-completion accessors above do not cover. These read a
+# ResponsesAPIResponse (non-streaming).
+
+def _item_attr(item, key):
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
+def extract_responses_input(kwargs):
+    """Extract input messages for the Responses API path (kwargs['input'])."""
+    try:
+        raw_input = kwargs.get("input")
+        if raw_input is None:
+            return []
+        if isinstance(raw_input, str):
+            return [get_json_dumps({"user": raw_input})]
+        messages = []
+        for item in raw_input:
+            role = _item_attr(item, "role")
+            content = _item_attr(item, "content")
+            if role and content is not None:
+                messages.append({role: content})
+            elif isinstance(item, dict):
+                messages.append(item)
+            else:
+                messages.append(str(item))
+        return [get_json_dumps(message) for message in messages]
+    except Exception as e:
+        logger.warning("Warning: Error occurred in extract_responses_input: %s", str(e))
+        return []
+
+
+def extract_responses_output(arguments):
+    """Extract assistant message/tool calls from a ResponsesAPIResponse."""
+    try:
+        if arguments.get("exception") is not None:
+            return get_exception_message(arguments)
+        response = arguments["result"]
+        if response is None:
+            return ""
+        messages = []
+        tools = []
+        texts = []
+        for item in getattr(response, "output", None) or []:
+            item_type = _item_attr(item, "type")
+            if item_type == "function_call":
+                tools.append({
+                    "tool_id": _item_attr(item, "call_id") or "",
+                    "tool_name": _item_attr(item, "name") or "",
+                    "tool_arguments": _item_attr(item, "arguments") or "",
+                })
+            elif item_type == "message":
+                for part in _item_attr(item, "content") or []:
+                    text = _item_attr(part, "text")
+                    if text:
+                        texts.append(text)
+        if tools:
+            messages.append({"tools": tools})
+        if texts:
+            messages.append({"assistant": "\n".join(texts)})
+        return get_json_dumps(messages[0]) if messages else ""
+    except Exception as e:
+        logger.warning("Warning: Error occurred in extract_responses_output: %s", str(e))
+        return None
+
+
+def extract_responses_finish_reason(arguments):
+    """Finish reason for the Responses API: tool_calls beat plain completion status."""
+    try:
+        if arguments.get("exception") is not None:
+            return "error"
+        response = arguments.get("result")
+        if response is None:
+            return None
+        for item in getattr(response, "output", None) or []:
+            if _item_attr(item, "type") == "function_call":
+                return "tool_calls"
+        return getattr(response, "status", None)
+    except Exception as e:
+        logger.warning("Warning: Error occurred in extract_responses_finish_reason: %s", str(e))
+        return None
+
+
+def responses_inference_type(arguments):
+    if extract_responses_finish_reason(arguments) == "tool_calls":
+        return INFERENCE_TOOL_CALL
+    return INFERENCE_TURN_END

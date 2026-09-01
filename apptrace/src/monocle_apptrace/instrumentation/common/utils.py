@@ -239,9 +239,14 @@ def build_setup_signature(
         wrapper_methods: Optional[list] = None,
         union_with_default_methods: bool = True,
         monocle_exporters_list: str = None,
+        otel_genai_semconv: object = None,
+        span_obfuscators: Optional[list] = None,
 ) -> dict:
     return {
         "workflow_name": workflow_name,
+        "span_obfuscators": tuple(
+            type(o).__name__ for o in (span_obfuscators or [])
+        ),
         "span_processors": tuple(type(p).__name__ for p in (span_processors or [])),
         "span_handlers": tuple(sorted((span_handlers or {}).keys())),
         "wrapper_methods": tuple(
@@ -250,6 +255,7 @@ def build_setup_signature(
         ),
         "union_with_default_methods": _normalize_bool(union_with_default_methods),
         "monocle_exporters_list": _normalize_exporters_list(monocle_exporters_list),
+        "otel_genai_semconv": otel_genai_semconv,
     }
 
 def changed_setup_fields(previous: dict, current: dict) -> list[str]:
@@ -370,6 +376,12 @@ def extract_http_headers(headers) -> object:
     for http_header, http_scope in http_scopes.items():
         if http_header in headers:
             imported_scope[http_scope] = f"{http_header}: {headers[http_header]}"
+    # trace-return opt-in: tag spans so the scope-filtered exporter captures them
+    from monocle_apptrace.instrumentation.common.trace_return import (
+        is_trace_return_enabled, is_trace_return_authorized)
+    from monocle_apptrace.instrumentation.common.constants import TRACE_RETURN_SCOPE_NAME
+    if is_trace_return_enabled() and is_trace_return_authorized(headers):
+        imported_scope[TRACE_RETURN_SCOPE_NAME] = "true"
     token = set_scopes(imported_scope, trace_context)
     return token
 
@@ -676,20 +688,28 @@ def propogate_inference_info_to_parent_span(span: Span, parent_span: Span):
     """Propagate inference information from child span to parent span. Copy the parent span's last inference id to tool spans.
         This way we link the inference span that's resulted in the tool call or agent delegation decision to the tool/agent invocation span."""
     if parent_span is not None and parent_span != INVALID_SPAN:
+        # The parent span may already be ended when this runs for deferred/streaming
+        # spans (e.g. an agent turn finalizing after the synchronous run_streamed call
+        # — and its workflow parent — has returned and closed). Writing to an ended span
+        # is a silent no-op that OTel logs as "Setting attribute on ended span"; skip it.
+        parent_writable = getattr(parent_span, "is_recording", lambda: True)()
         ## save last inference id in parent span
         if span.attributes.get("span.type") in [SPAN_TYPES.INFERENCE, SPAN_TYPES.INFERENCE_FRAMEWORK]:
             if span.attributes.get("span.subtype") in [INFERENCE_AGENT_DELEGATION, INFERENCE_TOOL_CALL]:
-                parent_span.set_attribute(LAST_INFERENCE, f"{format(span.context.span_id, '#018x')}:{span.attributes.get('entity.3.name', '')}")
+                if parent_writable:
+                    parent_span.set_attribute(LAST_INFERENCE, f"{format(span.context.span_id, '#018x')}:{span.attributes.get('entity.3.name', '')}")
             elif span.attributes.get("span.subtype") == INFERENCE_TURN_END:
-                parent_span.set_attribute(LAST_INFERENCE, f"{format(span.context.span_id, '#018x')}:{ANY_AGENT}")
+                if parent_writable:
+                    parent_span.set_attribute(LAST_INFERENCE, f"{format(span.context.span_id, '#018x')}:{ANY_AGENT}")
         # copy last infernce span id from parent span to tool span
         elif span.attributes.get("span.type") in [SPAN_TYPES.AGENTIC_TOOL_INVOCATION, SPAN_TYPES.AGENTIC_INVOCATION]:
             if LAST_INFERENCE in parent_span.attributes and verify_tool_names_in_spans(span, parent_span):
                 span.set_attribute(INFERENCE_DECISION, parent_span.attributes.get(LAST_INFERENCE).split(":")[0])
-                parent_span.set_attribute(LAST_INFERENCE, "")
+                if parent_writable:
+                    parent_span.set_attribute(LAST_INFERENCE, "")
 
         # propagate last inference id from child span to parent span
-        if span.attributes.get(LAST_INFERENCE, "") != "" and  (
+        if parent_writable and span.attributes.get(LAST_INFERENCE, "") != "" and  (
                 span.attributes.get("span.type") not in [SPAN_TYPES.AGENTIC_DELEGATION] \
                 or parent_span.attributes.get("span.subtype", "") not in [SPAN_SUBTYPES.ROUTING]
         ):

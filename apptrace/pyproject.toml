@@ -10,7 +10,7 @@ commands = [
 
 [project]
 name = "monocle_apptrace"
-version = "0.7.0"
+version = "0.8.7b1"
 authors = [
   { name="Okahu Inc.", email="okahu-pypi@okahu.ai" },
 ]
@@ -76,6 +76,11 @@ ai_test = [
    'transformers'
 ]
 
+obfuscation = [
+   'presidio-analyzer>=2.2.0',
+   'presidio-anonymizer>=2.2.0'
+]
+
 dev = [
   'langchain-openai',
   'langchain-chroma>=0.2.5',
@@ -86,8 +91,9 @@ dev = [
   'types-requests==2.31.0.20240106',
   'InstructorEmbedding==1.0.1',
   'faiss-cpu==1.8.0',
-  'pytest==8.3.5',
+  'pytest>=8.0.0',
   'pytest-venv',
+  'beautifulsoup4',  # bs4 is imported directly by test helpers (tests/common); no longer pulled transitively by llama-index 0.14
   'llama-index==0.13.0',
   'llama-index-llms-openai==0.5.0',
   'llama-index-tools-mcp==0.3.0',
@@ -99,12 +105,13 @@ dev = [
   'mistral-haystack==0.0.2',
   'langchain-aws>=0.3.0',
   'azure-storage-blob==12.22.0', # this is for blob exporter
-  'boto3==1.40.52', # this is for aws exporter
-  'llama-index-vector-stores-opensearch==0.6.0',
-  'haystack-ai==2.21.0',
+  'azure-functions==1.24.0', # this is for azfunc instrumentation tests (2.x requires Python>=3.13; 1.24.0 supports 3.7+)
+  'boto3==1.42.86', # this is for aws exporter (>=1.42.86 required by bedrock-agentcore 1.6.1)
+  'llama-index-vector-stores-opensearch==1.1.1',
+  'haystack-ai==3.0.0',
   'llama-index-llms-azure-openai==0.4.0',
   'requests-aws4auth==1.2.3',
-  'opensearch-haystack==1.2.0',
+  'opensearch-haystack==8.2.0',
   'langchainhub==0.1.21',
   'chromadb>=1.0.0,<2.0.0',
   'flask',
@@ -114,7 +121,7 @@ dev = [
   'opendal==0.45.14',
   'anthropic>=0.75.0',
   'anthropic-haystack==4.6.0',
-  'pytest-asyncio==0.26.0',
+  'pytest-asyncio>=0.26.0',
   'llama-index-llms-anthropic==0.8.1',
   'langchain-anthropic>=0.3.20',
   'langchain-mcp-adapters==0.2.1',
@@ -137,15 +144,14 @@ dev = [
   'google-adk',
   'openai-agents',
   'azure-identity',
-  'agent-framework-azure-ai',
-  'bedrock-agentcore==1.2.0',
+  'bedrock-agentcore==1.6.1',
   'opentelemetry-semantic-conventions==0.60b1',
   'opentelemetry-semantic-conventions-ai==0.4.13',
-  'agent-framework-core==1.5.0',
+  'agent-framework-core==1.15.0',
 ]
 
 dev_tranformers = [
-  'sentence-transformers==5.2.0'
+  'sentence-transformers-haystack==0.1.1'
 ]
 
 dev_gemini = [
@@ -157,13 +163,25 @@ dev_strands = [
   'strands-agents-tools==0.2.10'
 ]
 
+# Separate from dev because these require openai>=2, while dev pins
+# llama-index-llms-openai==0.5.0, which caps openai<2 — the two cannot resolve
+# together. agent-framework-openai imports FunctionShellTool, added in openai 2.8,
+# so its own declared floor of 1.99.0 is too low to import.
+dev_msagent = [
+  'agent-framework-openai==1.14.0',
+  # Replaces agent-framework-azure-ai, which imports BaseContextProvider — a
+  # symbol no agent-framework-core release exports — so it fails at import.
+  'agent-framework-foundry==1.11.0',
+  'openai>=2.8.0',
+]
+
 azure = [
     'azure-storage-blob==12.22.0',
     'azure-ai-inference'
 ]
 
 aws = [
-    'boto3==1.40.52',
+    'boto3==1.42.86',
 ]
 
 opentelemetry-exporter = [
@@ -172,6 +190,14 @@ opentelemetry-exporter = [
 
 gcp = [
     'google-cloud-storage==2.18.0',
+]
+
+postgres = [
+    'psycopg2-binary',
+]
+
+clickhouse = [
+    'clickhouse-connect',
 ]
 
 

@@ -1,5 +1,7 @@
 TEST_WORKFLOW_ENV: str = "MONOCLE_TEST_WORKFLOW_NAME"
 TEST_SCOPE_NAME: str = "test_name"
+SESSION_SCOPE_NAME: str = "session_id"
+TURN_SCOPE_NAME: str = "turn_id"
 GIT_RUN_ID_ATTRIBUTE: str = "git.run.id"
 GIT_WORKFLOW_NAME_ATTRIBUTE: str = "git.workflow.name"
 GIT_COMMIT_HASH_ATTRIBUTE: str = "git.commit.hash"
@@ -31,3 +33,8 @@ GITHUB_SHA: str = "GITHUB_SHA"
 
 # Local environment
 LOCAL_RUN_ID: str = "LOCAL_RUN_ID"
+
+# check_eval's `eval_type` qualifier: whether `eval_name` names a built-in eval
+# template or points at a JSON file holding a custom eval template. 
+BUILTIN_EVAL_TYPE: str = "builtin"
+CUSTOM_EVAL_TYPE: str = "custom"
